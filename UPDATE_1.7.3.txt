@@ -1,0 +1,11 @@
+1OFD Fiscal Docs — обновление 1.7.3
+
+1. Скопируй содержимое обновления поверх текущего репозитория с заменой файлов.
+2. git status
+3. git add .
+4. git commit -m "Release 1.7.3"
+5. git push
+6. После проверки сборки: git tag -a v1.7.3 -m "1OFD Fiscal Docs 1.7.3"
+7. git push origin v1.7.3
+
+Тег запускает GitHub Actions и публикацию EXE в Releases.

@@ -2082,8 +2082,19 @@ tbody tr:hover td{background:#edf7fd}
 .detail{position:relative;padding:12px 48px 12px 13px;overflow:hidden;background:var(--surface)}
 .detail small{display:block;color:var(--muted);margin-bottom:4px;font-weight:600}
 .detail-value{overflow-wrap:anywhere;word-break:break-word}
-.detail-copy{position:absolute;right:10px;top:50%;transform:translateY(-50%);width:30px;height:30px;border:0;border-radius:999px;background:var(--surface-2);color:var(--blue);cursor:pointer;font-size:17px;font-weight:800;display:flex;align-items:center;justify-content:center}
-.detail-copy:hover{background:var(--blue-pale);color:var(--blue-deep)}
+.detail-copy{position:absolute;right:10px;top:50%;transform:translateY(-50%);width:31px;height:31px;border:0;border-radius:999px;background:var(--surface-2);color:var(--blue);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .12s ease,color .12s ease,transform .12s ease}
+.detail-copy:hover{background:var(--blue-pale);color:var(--blue-deep);transform:translateY(-50%) scale(1.04)}
+.detail-copy svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.detail-copy .copy-check{display:none}
+.detail-copy.copied{background:var(--green-soft);color:var(--green)}
+.detail-copy.copied .copy-icon{display:none}
+.detail-copy.copied .copy-check{display:block}
+.detail-datetime{grid-column:span 2;padding:12px 13px;overflow:visible}
+.detail-datetime-title{display:block;color:var(--muted);margin-bottom:8px;font-weight:700;font-size:12px}
+.detail-datetime-fields{display:grid;grid-template-columns:1.45fr .8fr;gap:8px}
+.detail-subfield{position:relative;min-height:48px;padding:7px 43px 7px 11px;background:rgba(255,255,255,.58);border-radius:17px;display:flex;flex-direction:column;justify-content:center}
+.detail-subfield small{margin:0 0 2px;color:var(--muted);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.detail-subfield .detail-copy{right:7px;width:29px;height:29px}
 .raw-title{display:flex;align-items:center;justify-content:space-between;margin:16px 0 8px;font-weight:800;color:var(--blue-deep)}
 pre{margin:0;background:#112031;color:#d8e2ec;border-radius:22px;padding:16px;overflow:auto;max-height:420px;font-family:Consolas,monospace;font-size:12px;box-shadow:var(--shadow-soft)}
 .failure-list{max-height:440px;overflow:auto;background:var(--bg-soft);border-radius:var(--radius-lg);padding:10px}
@@ -2136,6 +2147,8 @@ pre{margin:0;background:#112031;color:#d8e2ec;border-radius:22px;padding:16px;ov
   .page-size{margin-left:0}
 }
 @media(max-width:640px){
+  .detail-datetime{grid-column:span 1}
+  .detail-datetime-fields{grid-template-columns:1fr}
   .topbar{padding:0 14px;height:auto;min-height:62px;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}
   .advanced-grid,.details-grid{grid-template-columns:1fr}
   .summary{grid-template-columns:1fr}
@@ -2144,7 +2157,7 @@ pre{margin:0;background:#112031;color:#d8e2ec;border-radius:22px;padding:16px;ov
 </style>
 </head>
 <body>
-<div class="topbar"><div class="brand">Первый ОФД <span>• Фискальные документы</span></div><div class="topnote">локальное веб-приложение • Universal API</div><div class="topbar-actions"><span class="version-chip">v1.7.2</span><button id="apiKeyBtn" class="api-key-btn">API-ключ</button></div></div>
+<div class="topbar"><div class="brand">Первый ОФД <span>• Фискальные документы</span></div><div class="topnote">локальное веб-приложение • Universal API</div><div class="topbar-actions"><span class="version-chip">v1.7.3</span><button id="apiKeyBtn" class="api-key-btn">API-ключ</button></div></div>
 <div class="page">
 
   <section class="panel" id="apiPanel">
@@ -2323,7 +2336,51 @@ function applyClientFilters(){const types=new Set(selected('.resultDocType')),bo
 function updateResultSummary(){const parts=[];if(resultTerms.length)parts.push(`условий поиска: ${resultTerms.length}`);const types=selected('.resultDocType');if(types.length<document.querySelectorAll('.resultDocType').length)parts.push(`типов: ${types.length}`);['rRnm','rKkt','rFn','rFd','rFpd','rShift','rInternal','rRetail','rAddress','rStatus'].forEach(id=>{if($(id).value.trim())parts.push($(id).previousElementSibling?.textContent||id)});$('resultFilterSummary').textContent=parts.length?parts.join(' • '):'Показываются все загруженные документы'}
 function updateStats(){const data=lastResponse||{},c=data.completeness||{};$('sLoaded').textContent=allRows.length;$('sShown').textContent=filteredRows.length;$('sKkt').textContent=data.kkm_count??'—';$('sMatchedKkt').textContent=data.matched_kkm_count??'—';$('sChecked').textContent=`${c.successful_queries??0}/${c.planned_queries??0}`;$('sFailed').textContent=c.failed_queries??'—';$('sUncertain').textContent=data.uncertain_candidate_count??'—';$('sTime').textContent=(data.elapsed_seconds??'—')+' сек';const counts={};filteredRows.forEach(r=>counts[r.type]=(counts[r.type]||0)+1);$('typeSummary').innerHTML=Object.entries(counts).map(([k,v])=>`<span class="type-pill">${esc(k)}: <b>${v}</b></span>`).join('')}
 function render(){const body=$('rows'),empty=$('empty'),size=pageSizeValue(),pages=Math.max(1,Math.ceil(filteredRows.length/size));if(currentPage>pages)currentPage=pages;const start=(currentPage-1)*size,items=filteredRows.slice(start,start+size);body.innerHTML=items.map((r,i)=>`<tr data-index="${start+i}"><td>${esc(r.date)}</td><td>${esc(r.kkm_internal_name)}</td><td>${esc(r.kkm_reg_id)}</td><td><span class="type ${esc(r.document_key)}">${esc(r.type)}</span></td><td>${esc(r.shift)}</td><td>${esc(r.fd)}</td><td>${r.amount==null?'—':esc(r.amount)}</td><td>${esc(r.fpd)}</td><td>${esc(r.fs_number)}</td><td>${esc(r.kkm_factory_number)}</td><td>${esc(r.fns_flc_status??r.fns_status)}</td><td>${esc(r.inserted_at)}</td><td>${esc(r.address)}</td></tr>`).join('');[...body.querySelectorAll('tr')].forEach(tr=>tr.onclick=()=>showDetails(filteredRows[Number(tr.dataset.index)]));empty.style.display=filteredRows.length?'none':'block';empty.textContent=allRows.length?'По текущим локальным фильтрам ничего не найдено.':'Сначала выполни запрос в Первый ОФД.';$('tableInfo').textContent=`Показано ${filteredRows.length} из ${allRows.length} документов`;$('pageText').textContent=`Страница ${filteredRows.length?currentPage:0} из ${filteredRows.length?pages:0}`;$('firstPage').disabled=$('prevPage').disabled=currentPage<=1;$('nextPage').disabled=$('lastPage').disabled=currentPage>=pages||!filteredRows.length}
-function showDetails(r){currentRaw=r.raw;const pairs=[['Тип',r.type],['Дата/время ККТ',r.date],['Поступил в ОФД',r.inserted_at],['РНМ',r.kkm_reg_id],['ЗН ККТ',r.kkm_factory_number],['ЗН ФН',r.fs_number],['ФД',r.fd],['ФПД',r.fpd],['Смена',r.shift],['Сумма',r.amount],['Статус ФЛК ФНС',r.fns_flc_status],['Код ФНС',r.fns_status],['Описание ФНС',r.fns_description],['Подтверждение ФНС',typeof r.fns_confirmation==='object'?JSON.stringify(r.fns_confirmation):r.fns_confirmation],['Внутреннее имя',r.kkm_internal_name],['Место установки',r.retail_place],['Адрес',r.address],['Активация ФН',r.activation_date],['Закрытие архива',r.close_archive_date],['Срок ФН',r.expire_date]];currentDetailValues=pairs.map(([,v])=>String(v??''));$('detailsGrid').innerHTML=pairs.map(([k,v],i)=>`<div class="detail"><small>${esc(k)}</small><div class="detail-value">${esc(v)}</div><button class="detail-copy" type="button" data-copy-index="${i}" title="Скопировать значение" aria-label="Скопировать значение">⧉</button></div>`).join('');$('rawJson').textContent=JSON.stringify(r.raw,null,2);$('detailsModal').classList.add('show')}
+function copyButtonHtml(index){return `<button class="detail-copy" type="button" data-copy-index="${index}" title="Скопировать" aria-label="Скопировать"><svg class="copy-icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="6.5" y="6.5" width="9" height="9" rx="2"></rect><path d="M5 13.5H4.5A2.5 2.5 0 0 1 2 11V4.5A2.5 2.5 0 0 1 4.5 2H11A2.5 2.5 0 0 1 13.5 4.5V5"></path></svg><svg class="copy-check" viewBox="0 0 20 20" aria-hidden="true"><path d="m4.5 10.5 3.3 3.3 7.7-8"></path></svg></button>`}
+function splitDisplayDateTime(value){const s=String(value??'').trim();const m=s.match(/^(\d{2}\.\d{2}\.\d{4})(?:\s+(\d{2}:\d{2}))?$/);return m?{date:m[1],time:m[2]||''}:null}
+function showDetails(r){
+  currentRaw=r.raw;
+  currentDetailValues=[];
+  const items=[
+    {label:'Тип',value:r.type},
+    {label:'Дата/время ККТ',value:r.date,datetime:true},
+    {label:'Поступил в ОФД',value:r.inserted_at,datetime:true},
+    {label:'РНМ',value:r.kkm_reg_id},
+    {label:'ЗН ККТ',value:r.kkm_factory_number},
+    {label:'ЗН ФН',value:r.fs_number},
+    {label:'ФД',value:r.fd},
+    {label:'ФПД',value:r.fpd},
+    {label:'Смена',value:r.shift},
+    {label:'Сумма',value:r.amount},
+    {label:'Статус ФЛК ФНС',value:r.fns_flc_status},
+    {label:'Код ФНС',value:r.fns_status},
+    {label:'Описание ФНС',value:r.fns_description},
+    {label:'Подтверждение ФНС',value:typeof r.fns_confirmation==='object'?JSON.stringify(r.fns_confirmation):r.fns_confirmation},
+    {label:'Внутреннее имя',value:r.kkm_internal_name},
+    {label:'Место установки',value:r.retail_place},
+    {label:'Адрес',value:r.address},
+    {label:'Активация ФН',value:r.activation_date,datetime:true},
+    {label:'Закрытие архива',value:r.close_archive_date,datetime:true},
+    {label:'Срок ФН',value:r.expire_date,datetime:true}
+  ];
+  const html=[];
+  for(const item of items){
+    const value=String(item.value??'');
+    const dt=item.datetime?splitDisplayDateTime(value):null;
+    if(dt&&dt.time){
+      const dateIndex=currentDetailValues.push(dt.date)-1;
+      const timeIndex=currentDetailValues.push(dt.time)-1;
+      html.push(`<div class="detail detail-datetime"><span class="detail-datetime-title">${esc(item.label)}</span><div class="detail-datetime-fields"><div class="detail-subfield"><small>Дата</small><div class="detail-value">${esc(dt.date)}</div>${copyButtonHtml(dateIndex)}</div><div class="detail-subfield"><small>Время</small><div class="detail-value">${esc(dt.time)}</div>${copyButtonHtml(timeIndex)}</div></div></div>`);
+    }else{
+      const copyValue=dt?dt.date:value;
+      const copyIndex=currentDetailValues.push(copyValue)-1;
+      html.push(`<div class="detail"><small>${esc(item.label)}</small><div class="detail-value">${esc(copyValue)}</div>${copyButtonHtml(copyIndex)}</div>`);
+    }
+  }
+  $('detailsGrid').innerHTML=html.join('');
+  $('rawJson').textContent=JSON.stringify(r.raw,null,2);
+  $('detailsModal').classList.add('show');
+}
 async function copyText(text){try{await navigator.clipboard.writeText(String(text??''));return true}catch(e){try{const ta=document.createElement('textarea');ta.value=String(text??'');ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();const ok=document.execCommand('copy');ta.remove();return ok}catch(_){return false}}}
 async function retryFailed(){if(!lastResponse)return;$('retryBtn').disabled=true;$('searchBtn').disabled=true;$('stopSearchBtn').disabled=false;$('statusbar').classList.add('show');statusTimer=setInterval(pollStatus,600);try{const res=await fetch('/api/retry-failed',{method:'POST'});const data=await res.json();if(!res.ok)throw new Error(data.detail||'Ошибка повторного запроса');if(data.cancelled){$('statusText').textContent=data.message||'Запрос остановлен';return}acceptResponse(data,false)}catch(e){alert(e.message)}finally{clearInterval(statusTimer);await pollStatus();setTimeout(()=>$('statusbar').classList.remove('show'),900);$('retryBtn').disabled=false;$('searchBtn').disabled=false;$('stopSearchBtn').disabled=true}}
 function showFailures(){if(!lastResponse)return;const c=lastResponse.completeness||{},failed=lastResponse.failed_queries||[],catalog=lastResponse.catalog_failures||[];$('failureSummary').textContent=`Не проверено документных запросов: ${c.failed_queries||0}. Не загружено мест установки: ${c.catalog_failed_places||0}.`;const parts=[];failed.forEach(x=>parts.push(`<div class="failure-row"><b>${esc((x.types||[]).join(', '))}</b><br><code>РНМ ${esc(x.rnm)} • ФН ${esc(x.fs_number)}</code><br><span class="muted">${esc(x.error)}</span></div>`));catalog.forEach(x=>parts.push(`<div class="failure-row"><b>Место установки ${esc(x.title||x.retailPlaceId)}</b><br><code>ID ${esc(x.retailPlaceId)}</code><br><span class="muted">${esc(x.error)}</span></div>`));$('failureList').innerHTML=parts.join('')||'<div class="failure-row">Непроверенных элементов нет.</div>';$('failuresModal').classList.add('show')}
@@ -2333,7 +2390,7 @@ function resetLocal(){resultTerms=[];renderTokens('result');$('rDateFrom').value
 function initDates(){const now=new Date(),local=new Date(now.getTime()-now.getTimezoneOffset()*60000).toISOString().slice(0,10);$('dateFrom').value=local;$('dateTo').value=local;$('rDateFrom').value=local;$('rDateTo').value=local}
 
 bindTokenInput('api');bindTokenInput('result');initDates();renderTokens('api');renderTokens('result');
-$('stopSearchBtn').onclick=stopSearch;$('detailsGrid').addEventListener('click',async e=>{const b=e.target.closest('.detail-copy');if(!b)return;const i=Number(b.dataset.copyIndex);const old=b.textContent;const ok=await copyText(currentDetailValues[i]??'');b.textContent=ok?'✓':'!';setTimeout(()=>b.textContent=old,800)});$('apiAdvancedBtn').onclick=()=>toggleAdvanced('apiAdvanced','apiAdvancedBtn');$('resultAdvancedBtn').onclick=()=>toggleAdvanced('resultAdvanced','resultAdvancedBtn');$('searchBtn').onclick=doSearch;$('applyResultBtn').onclick=applyClientFilters;$('retryBtn').onclick=retryFailed;$('catalogRetryBtn').onclick=()=>{$('qRefresh').checked=true;doSearch()};$('failedDetailsBtn').onclick=showFailures;$('csvBtn').onclick=downloadCSV;$('jsonBtn').onclick=downloadJSON;$('apiCoreTypes').onclick=()=>setChecks('.apiDocType','core');$('apiAllTypes').onclick=()=>setChecks('.apiDocType','all');$('apiNoTypes').onclick=()=>setChecks('.apiDocType','none');$('resultAllTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=true);applyClientFilters()};$('resultNoTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=false);applyClientFilters()};$('resetResultFilters').onclick=resetLocal;$('pageSize').onchange=()=>{currentPage=1;render()};$('firstPage').onclick=()=>{currentPage=1;render()};$('prevPage').onclick=()=>{currentPage=Math.max(1,currentPage-1);render()};$('nextPage').onclick=()=>{currentPage++;render()};$('lastPage').onclick=()=>{currentPage=Math.max(1,Math.ceil(filteredRows.length/pageSizeValue()));render()};document.querySelectorAll('[data-close]').forEach(x=>x.onclick=()=>$(x.dataset.close).classList.remove('show'));document.querySelectorAll('.modal').forEach(m=>m.onclick=e=>{if(e.target===m)m.classList.remove('show')});$('copyJson').onclick=async()=>{await navigator.clipboard.writeText(JSON.stringify(currentRaw,null,2));$('copyJson').textContent='Скопировано';setTimeout(()=>$('copyJson').textContent='Копировать JSON',900)};document.querySelectorAll('th[data-sort]').forEach(th=>th.onclick=()=>{const key=th.dataset.sort;if(sortState.key===key)sortState.dir=sortState.dir==='asc'?'desc':'asc';else{sortState.key=key;sortState.dir='asc'}applyClientFilters()});
+$('stopSearchBtn').onclick=stopSearch;$('detailsGrid').addEventListener('click',async e=>{const b=e.target.closest('.detail-copy');if(!b)return;const i=Number(b.dataset.copyIndex);const ok=await copyText(currentDetailValues[i]??'');if(ok){b.classList.add('copied');b.title='Скопировано';setTimeout(()=>{b.classList.remove('copied');b.title='Скопировать'},850)}else{b.title='Не удалось скопировать';setTimeout(()=>b.title='Скопировать',1000)}});$('apiAdvancedBtn').onclick=()=>toggleAdvanced('apiAdvanced','apiAdvancedBtn');$('resultAdvancedBtn').onclick=()=>toggleAdvanced('resultAdvanced','resultAdvancedBtn');$('searchBtn').onclick=doSearch;$('applyResultBtn').onclick=applyClientFilters;$('retryBtn').onclick=retryFailed;$('catalogRetryBtn').onclick=()=>{$('qRefresh').checked=true;doSearch()};$('failedDetailsBtn').onclick=showFailures;$('csvBtn').onclick=downloadCSV;$('jsonBtn').onclick=downloadJSON;$('apiCoreTypes').onclick=()=>setChecks('.apiDocType','core');$('apiAllTypes').onclick=()=>setChecks('.apiDocType','all');$('apiNoTypes').onclick=()=>setChecks('.apiDocType','none');$('resultAllTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=true);applyClientFilters()};$('resultNoTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=false);applyClientFilters()};$('resetResultFilters').onclick=resetLocal;$('pageSize').onchange=()=>{currentPage=1;render()};$('firstPage').onclick=()=>{currentPage=1;render()};$('prevPage').onclick=()=>{currentPage=Math.max(1,currentPage-1);render()};$('nextPage').onclick=()=>{currentPage++;render()};$('lastPage').onclick=()=>{currentPage=Math.max(1,Math.ceil(filteredRows.length/pageSizeValue()));render()};document.querySelectorAll('[data-close]').forEach(x=>x.onclick=()=>$(x.dataset.close).classList.remove('show'));document.querySelectorAll('.modal').forEach(m=>m.onclick=e=>{if(e.target===m)m.classList.remove('show')});$('copyJson').onclick=async()=>{await navigator.clipboard.writeText(JSON.stringify(currentRaw,null,2));$('copyJson').textContent='Скопировано';setTimeout(()=>$('copyJson').textContent='Копировать JSON',900)};document.querySelectorAll('th[data-sort]').forEach(th=>th.onclick=()=>{const key=th.dataset.sort;if(sortState.key===key)sortState.dir=sortState.dir==='asc'?'desc':'asc';else{sortState.key=key;sortState.dir='asc'}applyClientFilters()});
 ['timeFrom','timeTo','qRnm','qKkt','qFn','qInternal','qRetail','qAddress','qShift','qConcurrency'].forEach(id=>$(id).addEventListener('input',updateApiSummary));document.querySelectorAll('.apiDocType,.apiStatus').forEach(x=>x.addEventListener('change',updateApiSummary));['rDateFrom','rDateTo','rTimeFrom','rTimeTo'].forEach(id=>$(id).addEventListener('change',applyClientFilters));
 $('toggleApiKey').onclick=()=>{const input=$('newApiKey'),btn=$('toggleApiKey'),show=input.type==='password';input.type=show?'text':'password';btn.classList.toggle('visible',show);btn.setAttribute('aria-pressed',show?'true':'false')};
 $('apiKeyBtn').onclick=()=>{$('keyModal').classList.add('show');loadKeys(false)};$('addApiKeyBtn').onclick=addApiKey;$('newApiKey').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addApiKey()}});$('keyList').addEventListener('click',e=>{const s=e.target.closest('.key-select'),d=e.target.closest('.key-delete'),r=e.target.closest('.key-reveal');if(s)selectKey(s.dataset.id);if(d)deleteKey(d.dataset.id);if(r)toggleRevealKey(r.dataset.id)});loadKeys(true);
