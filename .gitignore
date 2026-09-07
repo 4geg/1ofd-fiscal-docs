@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime / secrets
+config.json
+ofd_kkm_cache.json
+logs/
+
+# OS
+Thumbs.db
+Desktop.ini
