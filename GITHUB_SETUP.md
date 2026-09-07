@@ -31,7 +31,7 @@
 ```powershell
 git init
 git add .
-git commit -m "Release 1.7.1"
+git commit -m "Release 1.7.2"
 git branch -M main
 git remote add origin https://github.com/USERNAME/1ofd-fiscal-docs.git
 git push -u origin main
@@ -46,7 +46,7 @@ git config --global user.name "4geg"
 git config --global user.email "ТВОЯ_ПОЧТА"
 ```
 
-После этого снова выполни `git commit -m "Release 1.7.1"`.
+После этого снова выполни `git commit -m "Release 1.7.2"`.
 
 ## 5. Получи готовый EXE через GitHub
 
@@ -58,15 +58,15 @@ git config --global user.email "ТВОЯ_ПОЧТА"
 4. **Run workflow → Run workflow**.
 5. Подожди окончания сборки.
 6. Открой готовый запуск workflow.
-7. Внизу страницы скачай artifact `1OFD_FiscalDocs-v1.7.1-Windows`.
+7. Внизу страницы скачай artifact `1OFD_FiscalDocs-v1.7.2-Windows`.
 
-## 6. Сделай Release 1.7.1
+## 6. Сделай Release 1.7.2
 
 В терминале VS Code:
 
 ```powershell
-git tag v1.7.1
-git push origin v1.7.1
+git tag v1.7.2
+git push origin v1.7.2
 ```
 
 После отправки тега GitHub Actions автоматически соберёт EXE и прикрепит его к GitHub Release.

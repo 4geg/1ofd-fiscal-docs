@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==========================================
-echo  Сборка 1OFD Fiscal Docs v1.7.1
+echo  Сборка 1OFD Fiscal Docs v1.7.2
  echo ==========================================
 
 if not exist ".venv\Scripts\python.exe" (

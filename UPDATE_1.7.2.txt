@@ -1,0 +1,11 @@
+1OFD Fiscal Docs — обновление 1.7.2
+
+1. Скопируй файлы обновления поверх текущей папки проекта с заменой.
+2. Проверь: git status
+3. Выполни:
+   git add .
+   git commit -m "Release 1.7.2"
+   git push
+4. GitHub → Actions → Build Windows EXE → Run workflow.
+5. Проверь EXE: Стоп, формат дат, копирование полей, копирование ссылки из трея.
+6. После проверки создай тег v1.7.2 и отправь его на GitHub для Release.

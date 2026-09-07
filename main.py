@@ -125,6 +125,69 @@ def open_web(*_args: Any) -> None:
     threading.Thread(target=_open_web_worker, name="open-web", daemon=True).start()
 
 
+def _copy_text_windows(text: str) -> bool:
+    """Copy Unicode text to Windows clipboard without external dependencies."""
+    if os.name != "nt":
+        return False
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+
+    data = (text + "\0").encode("utf-16-le")
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not handle:
+        return False
+
+    ptr = kernel32.GlobalLock(handle)
+    if not ptr:
+        kernel32.GlobalFree(handle)
+        return False
+
+    ctypes.memmove(ptr, data, len(data))
+    kernel32.GlobalUnlock(handle)
+
+    if not user32.OpenClipboard(None):
+        kernel32.GlobalFree(handle)
+        return False
+
+    success = False
+    try:
+        user32.EmptyClipboard()
+        # On success ownership of handle passes to the system; do not free it.
+        success = bool(user32.SetClipboardData(CF_UNICODETEXT, handle))
+    finally:
+        user32.CloseClipboard()
+
+    if not success:
+        kernel32.GlobalFree(handle)
+    return success
+
+
+def copy_interface_url(*_args: Any) -> None:
+    try:
+        if _copy_text_windows(CURRENT_WEB_URL):
+            LOGGER.info("Ссылка интерфейса скопирована: %s", CURRENT_WEB_URL)
+            _notify("1OFD Fiscal Docs", "Ссылка интерфейса скопирована в буфер обмена")
+        else:
+            raise RuntimeError("Windows clipboard API вернул ошибку")
+    except Exception:
+        LOGGER.exception("Не удалось скопировать ссылку интерфейса")
+        _notify("1OFD Fiscal Docs", "Не удалось скопировать ссылку. Откройте журнал.")
+
+
 def open_log(*_args: Any) -> None:
     log_path = LOG_DIR / "app.log"
     try:
@@ -404,6 +467,7 @@ def main() -> None:
 
     menu = pystray.Menu(
         pystray.MenuItem("Открыть", open_web, default=True),
+        pystray.MenuItem("Скопировать ссылку интерфейса", copy_interface_url),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Перезапустить", restart_app),
         pystray.MenuItem("Открыть журнал", open_log),

@@ -58,7 +58,7 @@ jobs:
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 1OFD_FiscalDocs-v1.7.1-Windows
+          name: 1OFD_FiscalDocs-v1.7.2-Windows
           path: dist/1OFD_FiscalDocs.exe
 
       - name: Attach EXE to GitHub Release
