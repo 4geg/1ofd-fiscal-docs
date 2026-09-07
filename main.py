@@ -24,6 +24,7 @@ from version import APP_DISPLAY_NAME, VERSION, HOST, PORT
 
 LOGGER = logging.getLogger("ofd_app")
 SERVER: uvicorn.Server | None = None
+SERVER_THREAD: threading.Thread | None = None
 TRAY: pystray.Icon | None = None
 _MUTEX_HANDLE = None
 CURRENT_PORT = PORT
@@ -31,6 +32,7 @@ CURRENT_WEB_URL = f"http://{HOST}:{PORT}"
 RUNTIME_FILE = APP_DATA_DIR / "runtime.json"
 SERVER_FAILED = threading.Event()
 SERVER_STOPPED = threading.Event()
+RESTART_LOCK = threading.Lock()
 
 
 def setup_logging() -> None:
@@ -40,7 +42,6 @@ def setup_logging() -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    # В onefile/перезапусках не плодим одинаковые handlers.
     if not any(isinstance(h, RotatingFileHandler) for h in root.handlers):
         root.addHandler(handler)
 
@@ -49,7 +50,7 @@ def _health_url(base_url: str) -> str:
     return base_url.rstrip("/") + "/api/health"
 
 
-def is_server_ready(base_url: str | None = None, timeout: float = 0.6) -> bool:
+def is_server_ready(base_url: str | None = None, timeout: float = 0.7) -> bool:
     url = _health_url(base_url or CURRENT_WEB_URL)
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -58,19 +59,18 @@ def is_server_ready(base_url: str | None = None, timeout: float = 0.6) -> bool:
         return False
 
 
-def wait_for_server(base_url: str | None = None, timeout: float = 20.0) -> bool:
+def wait_for_server(base_url: str | None = None, timeout: float = 25.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if SERVER_FAILED.is_set():
             return False
         if is_server_ready(base_url):
             return True
-        time.sleep(0.18)
+        time.sleep(0.2)
     return False
 
 
 def _open_url_windows(url: str) -> None:
-    """Open URL without blocking the tray callback thread."""
     try:
         if os.name == "nt":
             os.startfile(url)  # type: ignore[attr-defined]
@@ -78,7 +78,6 @@ def _open_url_windows(url: str) -> None:
     except Exception:
         LOGGER.exception("os.startfile не смог открыть браузер")
 
-    # Fallback для Windows/разработки. start "" URL корректно обрабатывает URL с & и т.п.
     try:
         if os.name == "nt":
             subprocess.Popen(
@@ -105,22 +104,24 @@ def _notify(title: str, message: str) -> None:
 
 def _open_web_worker(url: str | None = None, startup: bool = False) -> None:
     target = url or CURRENT_WEB_URL
-    timeout = 25.0 if startup else 4.0
+    timeout = 30.0 if startup else 5.0
     if wait_for_server(target, timeout=timeout):
+        # Небольшая пауза после первого успешного health-check снижает шанс гонки
+        # между готовностью сокета и полной инициализацией браузерного UI.
+        if startup:
+            time.sleep(0.35)
         LOGGER.info("Открываю веб-интерфейс: %s", target)
         _open_url_windows(target)
         return
 
     LOGGER.error("Веб-интерфейс недоступен: %s", target)
-    if startup or SERVER_FAILED.is_set():
-        _notify(
-            "1OFD Fiscal Docs",
-            "Веб-сервер не запустился. Откройте журнал через меню значка в трее.",
-        )
+    _notify(
+        "1OFD Fiscal Docs",
+        "Веб-сервер не запустился. Откройте журнал через меню значка в трее.",
+    )
 
 
 def open_web(*_args: Any) -> None:
-    # ВАЖНО: callbacks pystray не должны ждать сеть/сервер, иначе меню трея «подвисает».
     threading.Thread(target=_open_web_worker, name="open-web", daemon=True).start()
 
 
@@ -147,20 +148,6 @@ def open_data_folder(*_args: Any) -> None:
         LOGGER.exception("Не удалось открыть папку данных")
 
 
-def _wait_for_pid_to_exit(pid: int, timeout: float = 12.0) -> None:
-    if os.name != "nt" or pid <= 0:
-        return
-    kernel32 = ctypes.windll.kernel32
-    SYNCHRONIZE = 0x00100000
-    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-    if not handle:
-        return
-    try:
-        kernel32.WaitForSingleObject(handle, int(timeout * 1000))
-    finally:
-        kernel32.CloseHandle(handle)
-
-
 def _release_mutex() -> None:
     global _MUTEX_HANDLE
     if os.name == "nt" and _MUTEX_HANDLE:
@@ -175,62 +162,21 @@ def _release_mutex() -> None:
         _MUTEX_HANDLE = None
 
 
-def _restart_worker() -> None:
-    LOGGER.info("Перезапуск приложения")
-    old_pid = os.getpid()
-    if SERVER:
-        SERVER.should_exit = True
-
-    # Останавливаем UI трея раньше, а новый процесс ждёт завершения текущего PID.
-    try:
-        if TRAY:
-            TRAY.stop()
-    except Exception:
-        LOGGER.exception("Ошибка остановки трея при перезапуске")
-
-    if getattr(sys, "frozen", False):
-        cmd = [sys.executable, "--wait-for-pid", str(old_pid)]
-        cwd = str(Path(sys.executable).resolve().parent)
-    else:
-        cmd = [sys.executable, str(Path(__file__).resolve()), "--wait-for-pid", str(old_pid)]
-        cwd = str(Path(__file__).resolve().parent)
-
-    try:
-        subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            close_fds=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
-        )
-    except Exception:
-        LOGGER.exception("Не удалось запустить новый процесс")
-        _notify("1OFD Fiscal Docs", "Не удалось перезапустить приложение. Смотрите журнал.")
-        return
-
-    _remove_runtime_file()
-    _release_mutex()
-    # Даём subprocess стартовать и сразу выходим. Новый процесс сам дождётся PID.
-    time.sleep(0.1)
-    os._exit(0)
-
-
-def restart_app(*_args: Any) -> None:
-    threading.Thread(target=_restart_worker, name="restart", daemon=True).start()
-
-
-def exit_app(icon=None, item=None) -> None:
-    LOGGER.info("Завершение приложения")
-    if SERVER:
-        SERVER.should_exit = True
-    _remove_runtime_file()
-    _release_mutex()
-    if icon:
-        icon.stop()
+def _resource_path(relative: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative
 
 
 def create_tray_image() -> Image.Image:
+    # Используем ту же иконку, что у EXE. Fallback оставлен для разработки,
+    # если assets/app.ico отсутствует.
+    icon_path = _resource_path("assets/app.ico")
+    try:
+        if icon_path.exists():
+            return Image.open(icon_path).convert("RGBA")
+    except Exception:
+        LOGGER.exception("Не удалось загрузить assets/app.ico для трея")
+
     size = 64
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -258,9 +204,12 @@ def _port_is_free(port: int) -> bool:
             return False
 
 
-def choose_port() -> int:
-    # 4784 остаётся предпочтительным. Если его заняла другая программа — приложение не умирает.
-    for candidate in range(PORT, PORT + 20):
+def choose_port(preferred: int | None = None) -> int:
+    candidates: list[int] = []
+    if preferred is not None:
+        candidates.append(preferred)
+    candidates.extend(p for p in range(PORT, PORT + 20) if p not in candidates)
+    for candidate in candidates:
         if _port_is_free(candidate):
             return candidate
     raise RuntimeError(f"Не найден свободный локальный порт в диапазоне {PORT}-{PORT + 19}")
@@ -294,6 +243,8 @@ def _remove_runtime_file() -> None:
 
 def start_server(port: int) -> None:
     global SERVER
+    SERVER_FAILED.clear()
+    SERVER_STOPPED.clear()
     try:
         config = uvicorn.Config(
             app,
@@ -301,18 +252,87 @@ def start_server(port: int) -> None:
             port=port,
             log_level="warning",
             access_log=False,
-            # Для frozen/tray режима используем asyncio без внешнего авто-выбора loop implementation.
             loop="asyncio",
         )
-        SERVER = uvicorn.Server(config)
+        server = uvicorn.Server(config)
+        SERVER = server
         LOGGER.info("Запуск веб-сервера http://%s:%s", HOST, port)
-        SERVER.run()
+        server.run()
     except BaseException:
         SERVER_FAILED.set()
         LOGGER.exception("Критическая ошибка веб-сервера")
     finally:
         SERVER_STOPPED.set()
         LOGGER.info("Поток веб-сервера завершён")
+
+
+def _launch_server(port: int) -> None:
+    global SERVER_THREAD
+    SERVER_THREAD = threading.Thread(target=start_server, args=(port,), name="uvicorn", daemon=True)
+    SERVER_THREAD.start()
+
+
+def _stop_server(timeout: float = 10.0) -> bool:
+    global SERVER
+    server = SERVER
+    thread = SERVER_THREAD
+    if server is not None:
+        server.should_exit = True
+    if thread and thread.is_alive():
+        thread.join(timeout=timeout)
+    stopped = not thread or not thread.is_alive()
+    if stopped:
+        SERVER = None
+    return stopped
+
+
+def _restart_worker() -> None:
+    global CURRENT_PORT, CURRENT_WEB_URL
+    if not RESTART_LOCK.acquire(blocking=False):
+        return
+    try:
+        LOGGER.info("Перезапуск локального веб-сервера")
+        _notify("1OFD Fiscal Docs", "Перезапускаю веб-сервер…")
+
+        if not _stop_server(timeout=10.0):
+            LOGGER.error("Старый веб-сервер не остановился за отведённое время")
+            _notify("1OFD Fiscal Docs", "Не удалось перезапустить сервер. Откройте журнал.")
+            return
+
+        # Перезапускаем сервер в ЭТОМ ЖЕ процессе. Это принципиально для PyInstaller
+        # onefile: не создаём дочерний EXE и не оставляем заблокированный _MEI-каталог.
+        time.sleep(0.25)
+        try:
+            CURRENT_PORT = choose_port(preferred=CURRENT_PORT)
+        except Exception:
+            LOGGER.exception("Не удалось выбрать порт при перезапуске")
+            _notify("1OFD Fiscal Docs", "Не удалось выбрать локальный порт.")
+            return
+
+        CURRENT_WEB_URL = f"http://{HOST}:{CURRENT_PORT}"
+        _write_runtime_file(CURRENT_PORT)
+        _launch_server(CURRENT_PORT)
+
+        if wait_for_server(CURRENT_WEB_URL, timeout=25.0):
+            LOGGER.info("Веб-сервер успешно перезапущен")
+            _open_url_windows(CURRENT_WEB_URL)
+        else:
+            LOGGER.error("Веб-сервер не поднялся после перезапуска")
+            _notify("1OFD Fiscal Docs", "Веб-сервер не запустился после перезапуска.")
+    finally:
+        RESTART_LOCK.release()
+
+
+def restart_app(*_args: Any) -> None:
+    threading.Thread(target=_restart_worker, name="restart", daemon=True).start()
+
+
+def exit_app(icon=None, item=None) -> None:
+    LOGGER.info("Запрошено завершение приложения")
+    if SERVER:
+        SERVER.should_exit = True
+    if icon:
+        icon.stop()
 
 
 def acquire_single_instance() -> bool:
@@ -325,47 +345,57 @@ def acquire_single_instance() -> bool:
     return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
 
 
-def _process_cli_wait() -> None:
-    if "--wait-for-pid" not in sys.argv:
-        return
-    try:
-        idx = sys.argv.index("--wait-for-pid")
-        pid = int(sys.argv[idx + 1])
-    except (ValueError, IndexError):
-        return
-    _wait_for_pid_to_exit(pid)
-
-
 def _open_existing_instance() -> None:
     url = _read_runtime_url() or f"http://{HOST}:{PORT}"
-    LOGGER.info("Приложение уже запущено — открываю %s", url)
-    # Второй процесс не должен ждать 20 секунд: если runtime живой, открываем быстро.
-    if is_server_ready(url, timeout=0.8):
+    LOGGER.info("Приложение уже запущено — пробую открыть %s", url)
+    # Если второй запуск пришёл во время первого старта, несколько секунд ждём readiness.
+    if wait_for_server(url, timeout=6.0):
         _open_url_windows(url)
     else:
         LOGGER.warning("Найден mutex, но существующий веб-сервер не отвечает: %s", url)
 
 
+def _tray_setup(icon: pystray.Icon) -> None:
+    """Стартуем сервер только после того, как event-loop трея уже инициализирован."""
+    global CURRENT_PORT, CURRENT_WEB_URL
+    icon.visible = True
+    LOGGER.info("Tray готов, запускаю сервер")
+
+    try:
+        CURRENT_PORT = choose_port(preferred=CURRENT_PORT)
+    except Exception:
+        LOGGER.exception("Не удалось выбрать локальный порт")
+        _notify("1OFD Fiscal Docs", "Не удалось выбрать локальный порт. Откройте журнал.")
+        return
+
+    CURRENT_WEB_URL = f"http://{HOST}:{CURRENT_PORT}"
+    _write_runtime_file(CURRENT_PORT)
+    _launch_server(CURRENT_PORT)
+    threading.Thread(
+        target=_open_web_worker,
+        kwargs={"startup": True},
+        name="startup-open",
+        daemon=True,
+    ).start()
+
+
 def main() -> None:
     global TRAY, CURRENT_PORT, CURRENT_WEB_URL
     setup_logging()
-    LOGGER.info("==== START %s v%s pid=%s frozen=%s ====", APP_DISPLAY_NAME, VERSION, os.getpid(), getattr(sys, "frozen", False))
-
-    _process_cli_wait()
+    LOGGER.info(
+        "==== START %s v%s pid=%s frozen=%s ====",
+        APP_DISPLAY_NAME,
+        VERSION,
+        os.getpid(),
+        getattr(sys, "frozen", False),
+    )
 
     if not acquire_single_instance():
         _open_existing_instance()
         return
 
-    try:
-        CURRENT_PORT = choose_port()
-    except Exception:
-        LOGGER.exception("Не удалось выбрать локальный порт")
-        _release_mutex()
-        return
-
+    CURRENT_PORT = PORT
     CURRENT_WEB_URL = f"http://{HOST}:{CURRENT_PORT}"
-    _write_runtime_file(CURRENT_PORT)
 
     menu = pystray.Menu(
         pystray.MenuItem("Открыть", open_web, default=True),
@@ -383,17 +413,18 @@ def main() -> None:
         menu,
     )
 
-    # Сервер и автооткрытие браузера работают независимо от UI-потока трея.
-    threading.Thread(target=start_server, args=(CURRENT_PORT,), name="uvicorn", daemon=True).start()
-    threading.Thread(target=_open_web_worker, kwargs={"startup": True}, name="startup-open", daemon=True).start()
-
     try:
-        TRAY.run()
+        # setup вызывается после готовности event-loop трея — это устраняет гонку
+        # первого запуска, из-за которой браузер раньше иногда не открывался.
+        TRAY.run(setup=_tray_setup)
     except BaseException:
         LOGGER.exception("Критическая ошибка системного трея")
     finally:
+        LOGGER.info("Останавливаю веб-сервер перед завершением процесса")
         if SERVER:
             SERVER.should_exit = True
+        if SERVER_THREAD and SERVER_THREAD.is_alive():
+            SERVER_THREAD.join(timeout=10.0)
         _remove_runtime_file()
         _release_mutex()
         LOGGER.info("==== STOP pid=%s ====", os.getpid())

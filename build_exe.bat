@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==========================================
-echo  Сборка 1OFD Fiscal Docs v1.7.0
+echo  Сборка 1OFD Fiscal Docs v1.7.1
  echo ==========================================
 
 if not exist ".venv\Scripts\python.exe" (
@@ -23,18 +23,24 @@ echo [3/5] Устанавливаю зависимости сборки...
 python -m pip install -r requirements-build.txt
 if errorlevel 1 goto :error
 
-echo [4/5] Создаю иконку...
-python tools\make_icon.py
-if errorlevel 1 goto :error
+echo [4/5] Проверяю иконку...
+if not exist "assets\app.ico" (
+  python tools\make_icon.py
+  if errorlevel 1 goto :error
+) else (
+  echo Использую существующую assets\app.ico
+)
 
 echo [5/5] Собираю EXE...
 pyinstaller --noconfirm --clean --onefile --windowed ^
   --name "1OFD_FiscalDocs" ^
   --icon "assets\app.ico" ^
+  --add-data "assets\app.ico;assets" ^
   --collect-all uvicorn ^
   --collect-all fastapi ^
   --collect-all pydantic ^
   --collect-all httpx ^
+  --collect-data certifi ^
   --collect-all pystray ^
   --collect-all PIL ^
   main.py

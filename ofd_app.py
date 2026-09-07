@@ -1,19 +1,22 @@
 import asyncio
 import json
+import logging
 import random
 import time
 from datetime import datetime, timedelta
 from typing import Any
 
+import certifi
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from config_store import CACHE_FILE, add_or_select_profile, delete_profile, get_active_profile, list_profiles, select_profile
+from config_store import CACHE_FILE, add_or_select_profile, delete_profile, get_active_profile, get_profile_secret, list_profiles, select_profile
 from version import VERSION
 
 BASE_URL = "https://universal-api.1-ofd.ru"
+LOGGER = logging.getLogger("ofd_app.api")
 
 # Быстрый основной проход. Если часть запросов не проходит, программа сама
 # повторяет только их с меньшей параллельностью.
@@ -113,6 +116,20 @@ def contains(value: Any, needle: str) -> bool:
 def safe_error_text(error: Exception) -> str:
     text = f"{type(error).__name__}: {error}"
     return text[:800]
+
+
+def create_http_client(*, limits: httpx.Limits, timeout: httpx.Timeout, http2: bool = False) -> httpx.AsyncClient:
+    """Create one HTTP client with an explicit bundled CA store.
+
+    PyInstaller onefile does not always discover certifi's CA bundle reliably on its own.
+    Keeping this explicit makes HTTPS behave the same in source and in the frozen EXE.
+    """
+    return httpx.AsyncClient(
+        limits=limits,
+        timeout=timeout,
+        http2=http2,
+        verify=certifi.where(),
+    )
 
 
 async def request_json(
@@ -1229,7 +1246,7 @@ async def perform_search(request: SearchRequest) -> dict[str, Any]:
     )
     timeout = httpx.Timeout(connect=15, read=70, write=30, pool=60)
 
-    async with httpx.AsyncClient(limits=limits, timeout=timeout, http2=False) as client:
+    async with create_http_client(limits=limits, timeout=timeout, http2=False) as client:
         set_state(stage="Авторизация", done=0, total=1, found=0, errors=0)
         token = await get_token(client)
 
@@ -1409,7 +1426,7 @@ async def retry_last_failed() -> dict[str, Any]:
     )
     timeout = httpx.Timeout(connect=20, read=90, write=30, pool=45)
 
-    async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
+    async with create_http_client(limits=limits, timeout=timeout) as client:
         token = await get_token(client)
         rows, still_failed, succeeded = await execute_task_batch(
             client,
@@ -1487,16 +1504,43 @@ async def api_keys_add(request: ApiKeyAddRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="API-ключ не введён")
 
     limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
-    timeout = httpx.Timeout(connect=12, read=30, write=20, pool=15)
+    timeout = httpx.Timeout(connect=15, read=35, write=20, pool=20)
+
+    # Валидность ключа определяется успешной авторизацией. Получение названия
+    # организации — полезный, но НЕ обязательный второй запрос: его временный
+    # сбой не должен заставлять пользователя повторно вводить рабочий ключ.
     try:
-        async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
+        async with create_http_client(limits=limits, timeout=timeout) as client:
             token = await authenticate_api_key(client, api_key)
-            organisations = await get_organisations(client, token)
+            organisations: list[dict[str, Any]] = []
+            try:
+                organisations = await get_organisations(client, token)
+            except Exception as org_error:
+                LOGGER.warning("API-ключ авторизован, но организация не прочитана: %s", safe_error_text(org_error))
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code
+        LOGGER.warning("1-ОФД отклонил API-ключ: HTTP %s", status)
+        if status in (400, 401, 403):
+            detail = "1-ОФД не принял API-ключ. Проверь, что ключ скопирован полностью и относится к Universal API."
+        else:
+            detail = f"1-ОФД вернул HTTP {status} при проверке API-ключа. Попробуй ещё раз."
+        raise HTTPException(status_code=400, detail=detail) from error
+    except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as error:
+        LOGGER.warning("Сетевая ошибка проверки API-ключа: %s", safe_error_text(error))
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось подключиться к Universal API 1-ОФД. Проверь интернет и повтори попытку.",
+        ) from error
     except Exception as error:
-        raise HTTPException(status_code=400, detail="Не удалось проверить API-ключ. Проверь правильность ключа и доступ к 1-ОФД.") from error
+        LOGGER.exception("Неожиданная ошибка проверки API-ключа")
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось проверить API-ключ. Подробности записаны в журнал приложения.",
+        ) from error
 
     org_name = str((organisations[0] if organisations else {}).get("organizationName") or "API-ключ 1-ОФД")
     profile = add_or_select_profile(api_key, org_name)
+    TOKEN_CACHE.pop(str(profile["id"]), None)
     return {"profile": profile, **list_profiles()}
 
 
@@ -1507,6 +1551,16 @@ async def api_keys_select(request: ApiKeySelectRequest) -> dict[str, Any]:
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     return {"profile": profile, **list_profiles()}
+
+
+@app.get("/api/keys/{profile_id}/reveal")
+async def api_keys_reveal(profile_id: str) -> dict[str, str]:
+    try:
+        api_key = get_profile_secret(profile_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    # Endpoint доступен только локальному UI приложения. Значение не логировать.
+    return {"api_key": api_key}
 
 
 @app.delete("/api/keys/{profile_id}")
@@ -1998,11 +2052,24 @@ pre{margin:0;background:#112031;color:#d8e2ec;border-radius:22px;padding:16px;ov
 .key-list{display:flex;flex-direction:column;gap:10px;margin:10px 0 16px}
 .key-row{display:flex;align-items:center;gap:12px;background:var(--surface);padding:12px 14px;border-radius:22px}
 .key-main{flex:1;min-width:0}.key-main b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.key-main small{color:var(--muted)}
+.key-secret-line{display:flex;align-items:center;gap:7px;margin-top:3px;min-height:24px}
+.key-secret-value{font-family:Consolas,monospace;font-size:12px;color:var(--muted);word-break:break-all}
+.key-reveal{width:28px;height:28px;min-width:28px;border:0;border-radius:999px;background:var(--surface-2);color:var(--blue);cursor:pointer;display:flex;align-items:center;justify-content:center}
+.key-reveal:hover{background:var(--blue-pale)}
+.key-reveal svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .key-actions{display:flex;gap:8px;align-items:center}
 .key-empty{padding:16px;background:var(--surface);border-radius:22px;color:var(--muted);text-align:center}
 .key-add-grid{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}
 .key-note{margin-top:10px;color:var(--muted);font-size:12px}
 .key-error{display:none;margin-top:10px;background:var(--red-soft);color:var(--red);padding:10px 12px;border-radius:18px;font-weight:600}.key-error.show{display:block}
+.secret-wrap{position:relative}
+.secret-wrap .input{padding-right:52px}
+.secret-toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:36px;height:36px;border:0;border-radius:999px;background:var(--surface-2);color:var(--blue);cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow-soft)}
+.secret-toggle:hover{background:var(--blue-pale)}
+.secret-toggle svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.secret-toggle .eye-off{display:none}
+.secret-toggle.visible .eye-on{display:none}
+.secret-toggle.visible .eye-off{display:block}
 
 @media(max-width:1450px){
   .panel-main{grid-template-columns:1fr 170px 170px minmax(320px,1.35fr) 72px minmax(170px,.8fr)}
@@ -2030,7 +2097,7 @@ pre{margin:0;background:#112031;color:#d8e2ec;border-radius:22px;padding:16px;ov
 </style>
 </head>
 <body>
-<div class="topbar"><div class="brand">Первый ОФД <span>• Фискальные документы</span></div><div class="topnote">локальное веб-приложение • Universal API</div><div class="topbar-actions"><span class="version-chip">v1.7.0</span><button id="apiKeyBtn" class="api-key-btn">API-ключ</button></div></div>
+<div class="topbar"><div class="brand">Первый ОФД <span>• Фискальные документы</span></div><div class="topnote">локальное веб-приложение • Universal API</div><div class="topbar-actions"><span class="version-chip">v1.7.1</span><button id="apiKeyBtn" class="api-key-btn">API-ключ</button></div></div>
 <div class="page">
 
   <section class="panel" id="apiPanel">
@@ -2147,7 +2214,7 @@ pre{margin:0;background:#112031;color:#d8e2ec;border-radius:22px;padding:16px;ov
   </div>
 </div>
 
-<div id="keyModal" class="modal"><div class="modal-box" style="width:min(760px,96vw)"><div class="modal-title">API-ключ Первого ОФД <button class="close-x" data-close="keyModal">×</button></div><div class="modal-body"><div id="keyList" class="key-list"></div><div class="key-add-grid"><div class="field"><label>Добавить новый API-ключ</label><input id="newApiKey" class="input" type="password" autocomplete="off" placeholder="Вставьте API-ключ"></div><button id="addApiKeyBtn" class="btn primary">Проверить и сохранить</button></div><div id="keyError" class="key-error"></div><div class="key-note">Ключ проверяется через Universal API и сохраняется только на этом компьютере. В Windows он хранится в зашифрованном виде через DPAPI.</div></div></div></div>
+<div id="keyModal" class="modal"><div class="modal-box" style="width:min(760px,96vw)"><div class="modal-title">API-ключ Первого ОФД <button class="close-x" data-close="keyModal">×</button></div><div class="modal-body"><div id="keyList" class="key-list"></div><div class="key-add-grid"><div class="field"><label>Добавить новый API-ключ</label><div class="secret-wrap"><input id="newApiKey" class="input" type="password" autocomplete="off" placeholder="Вставьте API-ключ"><button id="toggleApiKey" class="secret-toggle" type="button" title="Показать / скрыть API-ключ" aria-label="Показать или скрыть API-ключ"><svg class="eye-on" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.8"/></svg><svg class="eye-off" viewBox="0 0 24 24"><path d="m3 3 18 18"/><path d="M10.6 6.2A10.9 10.9 0 0 1 12 6c6 0 9.5 6 9.5 6a15.5 15.5 0 0 1-3.1 3.7"/><path d="M6.4 6.4C3.9 8.2 2.5 12 2.5 12s3.5 6 9.5 6c1.2 0 2.3-.2 3.3-.6"/></svg></button></div></div><button id="addApiKeyBtn" class="btn primary">Проверить и сохранить</button></div><div id="keyError" class="key-error"></div><div class="key-note">Ключ проверяется через Universal API и сохраняется только на этом компьютере. В Windows он хранится в зашифрованном виде через DPAPI.</div></div></div></div>
 <div id="detailsModal" class="modal"><div class="modal-box"><div class="modal-title">Фискальный документ <button class="close-x" data-close="detailsModal">×</button></div><div class="modal-body"><div id="detailsGrid" class="details-grid"></div><div class="raw-title"><b>Полный ответ API</b><button id="copyJson" class="btn mini">Копировать JSON</button></div><pre id="rawJson"></pre></div></div></div>
 <div id="failuresModal" class="modal"><div class="modal-box"><div class="modal-title">Непроверенные элементы <button class="close-x" data-close="failuresModal">×</button></div><div class="modal-body"><div id="failureSummary" style="margin-bottom:10px"></div><div id="failureList" class="failure-list"></div></div></div></div>
 
@@ -2156,14 +2223,14 @@ const $=id=>document.getElementById(id);
 const TYPE_LABELS={registration:'Регистрация',reregistration:'Перерегистрация',close:'Закрытие ФН',ticket:'Кассовый чек',open_shift:'Открытие смены',close_shift:'Закрытие смены',receipt_correction:'Чек коррекции',bso:'БСО',bso_correction:'БСО коррекции'};
 const CORE_TYPES=new Set(['registration','reregistration','close']);
 const HEAVY_TYPES=new Set(['ticket','open_shift','close_shift','receipt_correction','bso','bso_correction']);
-let apiTerms=[],resultTerms=[],allRows=[],filteredRows=[],lastResponse=null,currentPage=1,sortState={key:'date',dir:'desc'},statusTimer=null,currentRaw=null,keyState={active_id:null,profiles:[]};
+let apiTerms=[],resultTerms=[],allRows=[],filteredRows=[],lastResponse=null,currentPage=1,sortState={key:'date',dir:'desc'},statusTimer=null,currentRaw=null,keyState={active_id:null,profiles:[]},revealedKeys={};
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function lc(v){return String(v??'').trim().toLowerCase()}
 function contains(v,n){return !n||lc(v).includes(lc(n))}
 function renderKeys(){
   const list=$('keyList'),profiles=keyState.profiles||[];
   if(!profiles.length){list.innerHTML='<div class="key-empty">Сохранённых API-ключей пока нет.</div>'}
-  else{list.innerHTML=profiles.map(p=>`<div class="key-row"><div class="key-main"><b>${esc(p.name||'API-ключ')}</b><small>••••${esc(p.last4||'')} ${p.active?'• используется сейчас':''}</small></div><div class="key-actions">${p.active?'<span class="version-chip">Активен</span>':`<button class="btn mini key-select" data-id="${esc(p.id)}">Выбрать</button>`}<button class="btn mini key-delete" data-id="${esc(p.id)}">Удалить</button></div></div>`).join('')}
+  else{list.innerHTML=profiles.map(p=>{const revealed=revealedKeys[p.id];const secret=revealed?esc(revealed):`••••${esc(p.last4||'')}`;return `<div class="key-row"><div class="key-main"><b>${esc(p.name||'API-ключ')}</b><div class="key-secret-line"><span class="key-secret-value">${secret} ${p.active?'• используется сейчас':''}</span><button class="key-reveal" data-id="${esc(p.id)}" title="Показать / скрыть API-ключ"><svg viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></div></div><div class="key-actions">${p.active?'<span class="version-chip">Активен</span>':`<button class="btn mini key-select" data-id="${esc(p.id)}">Выбрать</button>`}<button class="btn mini key-delete" data-id="${esc(p.id)}">Удалить</button></div></div>`}).join('')}
   const active=profiles.find(p=>p.active);
   $('apiKeyBtn').textContent=active?`API: ${active.name} ••••${active.last4}`:'API-ключ';
   $('apiKeyBtn').classList.toggle('active',!!active);
@@ -2171,10 +2238,15 @@ function renderKeys(){
 async function loadKeys(openIfMissing=false){
   try{keyState=await fetch('/api/keys').then(r=>r.json());renderKeys();if(openIfMissing&&!(keyState.profiles||[]).some(p=>p.active))$('keyModal').classList.add('show')}catch(e){}
 }
+async function toggleRevealKey(id){
+  if(revealedKeys[id]){delete revealedKeys[id];renderKeys();return}
+  try{const res=await fetch('/api/keys/'+encodeURIComponent(id)+'/reveal');const data=await res.json();if(!res.ok)throw new Error(data.detail||'Не удалось показать ключ');revealedKeys[id]=data.api_key||'';renderKeys();setTimeout(()=>{if(revealedKeys[id]){delete revealedKeys[id];renderKeys()}},30000)}
+  catch(e){alert(e.message)}
+}
 async function addApiKey(){
   const key=$('newApiKey').value.trim(),err=$('keyError');err.classList.remove('show');if(!key){err.textContent='Вставьте API-ключ';err.classList.add('show');return}
   $('addApiKeyBtn').disabled=true;$('addApiKeyBtn').textContent='Проверяю…';
-  try{const res=await fetch('/api/keys/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key})});const data=await res.json();if(!res.ok)throw new Error(data.detail||'Не удалось сохранить ключ');keyState=data;$('newApiKey').value='';renderKeys();$('keyModal').classList.remove('show')}
+  try{const res=await fetch('/api/keys/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key})});const data=await res.json();if(!res.ok)throw new Error(data.detail||'Не удалось сохранить ключ');keyState=data;$('newApiKey').value='';$('newApiKey').type='password';$('toggleApiKey').classList.remove('visible');renderKeys();$('keyModal').classList.remove('show')}
   catch(e){err.textContent=e.message;err.classList.add('show')}
   finally{$('addApiKeyBtn').disabled=false;$('addApiKeyBtn').textContent='Проверить и сохранить'}
 }
@@ -2214,7 +2286,8 @@ function initDates(){const now=new Date(),local=new Date(now.getTime()-now.getTi
 bindTokenInput('api');bindTokenInput('result');initDates();renderTokens('api');renderTokens('result');
 $('apiAdvancedBtn').onclick=()=>toggleAdvanced('apiAdvanced','apiAdvancedBtn');$('resultAdvancedBtn').onclick=()=>toggleAdvanced('resultAdvanced','resultAdvancedBtn');$('searchBtn').onclick=doSearch;$('applyResultBtn').onclick=applyClientFilters;$('retryBtn').onclick=retryFailed;$('catalogRetryBtn').onclick=()=>{$('qRefresh').checked=true;doSearch()};$('failedDetailsBtn').onclick=showFailures;$('csvBtn').onclick=downloadCSV;$('jsonBtn').onclick=downloadJSON;$('apiCoreTypes').onclick=()=>setChecks('.apiDocType','core');$('apiAllTypes').onclick=()=>setChecks('.apiDocType','all');$('apiNoTypes').onclick=()=>setChecks('.apiDocType','none');$('resultAllTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=true);applyClientFilters()};$('resultNoTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=false);applyClientFilters()};$('resetResultFilters').onclick=resetLocal;$('pageSize').onchange=()=>{currentPage=1;render()};$('firstPage').onclick=()=>{currentPage=1;render()};$('prevPage').onclick=()=>{currentPage=Math.max(1,currentPage-1);render()};$('nextPage').onclick=()=>{currentPage++;render()};$('lastPage').onclick=()=>{currentPage=Math.max(1,Math.ceil(filteredRows.length/pageSizeValue()));render()};document.querySelectorAll('[data-close]').forEach(x=>x.onclick=()=>$(x.dataset.close).classList.remove('show'));document.querySelectorAll('.modal').forEach(m=>m.onclick=e=>{if(e.target===m)m.classList.remove('show')});$('copyJson').onclick=async()=>{await navigator.clipboard.writeText(JSON.stringify(currentRaw,null,2));$('copyJson').textContent='Скопировано';setTimeout(()=>$('copyJson').textContent='Копировать JSON',900)};document.querySelectorAll('th[data-sort]').forEach(th=>th.onclick=()=>{const key=th.dataset.sort;if(sortState.key===key)sortState.dir=sortState.dir==='asc'?'desc':'asc';else{sortState.key=key;sortState.dir='asc'}applyClientFilters()});
 ['timeFrom','timeTo','qRnm','qKkt','qFn','qInternal','qRetail','qAddress','qShift','qConcurrency'].forEach(id=>$(id).addEventListener('input',updateApiSummary));document.querySelectorAll('.apiDocType,.apiStatus').forEach(x=>x.addEventListener('change',updateApiSummary));['rDateFrom','rDateTo','rTimeFrom','rTimeTo'].forEach(id=>$(id).addEventListener('change',applyClientFilters));
-$('apiKeyBtn').onclick=()=>{$('keyModal').classList.add('show');loadKeys(false)};$('addApiKeyBtn').onclick=addApiKey;$('newApiKey').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addApiKey()}});$('keyList').addEventListener('click',e=>{const s=e.target.closest('.key-select'),d=e.target.closest('.key-delete');if(s)selectKey(s.dataset.id);if(d)deleteKey(d.dataset.id)});loadKeys(true);
+$('toggleApiKey').onclick=()=>{const input=$('newApiKey'),btn=$('toggleApiKey'),show=input.type==='password';input.type=show?'text':'password';btn.classList.toggle('visible',show);btn.setAttribute('aria-pressed',show?'true':'false')};
+$('apiKeyBtn').onclick=()=>{$('keyModal').classList.add('show');loadKeys(false)};$('addApiKeyBtn').onclick=addApiKey;$('newApiKey').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addApiKey()}});$('keyList').addEventListener('click',e=>{const s=e.target.closest('.key-select'),d=e.target.closest('.key-delete'),r=e.target.closest('.key-reveal');if(s)selectKey(s.dataset.id);if(d)deleteKey(d.dataset.id);if(r)toggleRevealKey(r.dataset.id)});loadKeys(true);
 updateApiSummary();render();updateStats();
 </script>
 </body>

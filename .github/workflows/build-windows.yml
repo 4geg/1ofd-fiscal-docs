@@ -27,8 +27,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
 
-      - name: Create icon
-        run: python tools/make_icon.py
+      - name: Ensure icon exists
+        shell: powershell
+        run: |
+          if (-not (Test-Path "assets/app.ico")) {
+            python tools/make_icon.py
+          } else {
+            Write-Host "Using existing assets/app.ico"
+          }
 
       - name: Syntax check
         run: python -m py_compile main.py ofd_app.py config_store.py version.py
@@ -39,10 +45,12 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --windowed
           --name "1OFD_FiscalDocs"
           --icon "assets\app.ico"
+          --add-data "assets\app.ico;assets"
           --collect-all uvicorn
           --collect-all fastapi
           --collect-all pydantic
           --collect-all httpx
+          --collect-data certifi
           --collect-all pystray
           --collect-all PIL
           main.py
@@ -50,7 +58,7 @@ jobs:
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 1OFD_FiscalDocs-v1.7.0-Windows
+          name: 1OFD_FiscalDocs-v1.7.1-Windows
           path: dist/1OFD_FiscalDocs.exe
 
       - name: Attach EXE to GitHub Release

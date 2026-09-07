@@ -181,6 +181,15 @@ def add_or_select_profile(api_key: str, name: str) -> dict[str, Any]:
     return _public_profile(profile, profile["id"])
 
 
+def get_profile_secret(profile_id: str) -> str:
+    """Return decrypted key for the local UI only. Never log the returned value."""
+    data = load_config()
+    for profile in data.get("profiles", []):
+        if profile.get("id") == profile_id:
+            return unprotect_secret(str(profile.get("secret", "")))
+    raise ValueError("Сохранённый API-ключ не найден")
+
+
 def select_profile(profile_id: str) -> dict[str, Any]:
     data = load_config()
     for profile in data.get("profiles", []):
