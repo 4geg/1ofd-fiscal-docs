@@ -253,6 +253,11 @@ def start_server(port: int) -> None:
             log_level="warning",
             access_log=False,
             loop="asyncio",
+            # В PyInstaller --noconsole sys.stdout/sys.stderr == None.
+            # Стандартный log_config Uvicorn пытается вызвать sys.stdout.isatty()
+            # и падает до старта веб-сервера. Собственное логирование приложения
+            # уже настроено выше, поэтому конфигурацию логов Uvicorn отключаем.
+            log_config=None,
         )
         server = uvicorn.Server(config)
         SERVER = server
