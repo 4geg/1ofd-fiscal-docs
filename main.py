@@ -38,7 +38,7 @@ RESTART_LOCK = threading.Lock()
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / "app.log"
-    handler = RotatingFileHandler(log_file, maxBytes=1_500_000, backupCount=3, encoding="utf-8")
+    handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=4, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.setLevel(logging.INFO)

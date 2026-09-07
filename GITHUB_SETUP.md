@@ -1,72 +1,54 @@
-# Публикация на GitHub — пошагово
+# Обновление проекта и выпуск GitHub Release
 
-Самый простой вариант без GitHub Desktop.
+Текущий репозиторий: `4geg/1ofd-fiscal-docs`.
 
-## 1. Создай пустой репозиторий
+## Если репозиторий уже есть на компьютере
 
-1. Открой github.com и войди в аккаунт.
-2. Нажми **New repository**.
-3. Имя, например: `1ofd-fiscal-docs`.
-4. Выбери **Private** или **Public**.
-5. **Не** ставь галочки `Add a README`, `.gitignore`, `license` — они уже есть в проекте.
-6. Нажми **Create repository**.
-7. На следующей странице скопируй HTTPS-адрес репозитория, например `https://github.com/USERNAME/1ofd-fiscal-docs.git`.
-
-## 2. Распакуй проект
-
-Распакуй архив проекта в обычную папку, например:
-
-`C:\Projects\1ofd-fiscal-docs`
-
-## 3. Открой папку в VS Code
-
-**File → Open Folder →** выбери папку проекта.
-
-Открой **Terminal → New Terminal**.
-
-## 4. Выполни команды
-
-По одной строке:
+1. Распакуй обновлённый проект поверх локальной папки репозитория с заменой файлов.
+2. Открой эту папку в VS Code.
+3. Выполни:
 
 ```powershell
-git init
+git status
 git add .
-git commit -m "Release 1.7.3"
-git branch -M main
-git remote add origin https://github.com/USERNAME/1ofd-fiscal-docs.git
-git push -u origin main
+git commit -m "Release 1.7.4"
+git push
 ```
 
-В четвёртой команде замени URL на адрес своего репозитория.
-
-Если Git попросит имя и почту:
+4. Сначала при необходимости проверь сборку через **GitHub → Actions → Build Windows EXE → Run workflow**.
+5. Когда версия готова к публикации в Releases, создай и отправь тег:
 
 ```powershell
-git config --global user.name "4geg"
-git config --global user.email "ТВОЯ_ПОЧТА"
+git tag -a v1.7.4 -m "1OFD Fiscal Docs 1.7.4"
+git push origin v1.7.4
 ```
 
-После этого снова выполни `git commit -m "Release 1.7.3"`.
+Push тега автоматически запускает workflow. Он собирает `1OFD_FiscalDocs.exe`, создаёт/обновляет GitHub Release для `v1.7.4` и прикрепляет EXE к Assets.
 
-## 5. Получи готовый EXE через GitHub
+Прямая ссылка из README всегда ведёт на EXE последнего релиза:
 
-Самый простой путь:
+`https://github.com/4geg/1ofd-fiscal-docs/releases/latest/download/1OFD_FiscalDocs.exe`
 
-1. Открой репозиторий на GitHub.
-2. Вкладка **Actions**.
-3. Слева **Build Windows EXE**.
-4. **Run workflow → Run workflow**.
-5. Подожди окончания сборки.
-6. Открой готовый запуск workflow.
-7. Внизу страницы скачай artifact `1OFD_FiscalDocs-v1.7.3-Windows`.
+## Если локальной папки репозитория больше нет
 
-## 6. Сделай Release 1.7.3
-
-В терминале VS Code:
+Не делай новый `git init`. Сначала клонируй существующий репозиторий:
 
 ```powershell
-git tag v1.7.3
-git push origin v1.7.3
+cd C:\Users\peshka_Linkkoma\Desktop
+git clone https://github.com/4geg/1ofd-fiscal-docs.git
+cd .\1ofd-fiscal-docs\
 ```
 
-После отправки тега GitHub Actions автоматически соберёт EXE и прикрепит его к GitHub Release.
+Затем скопируй содержимое полного архива новой версии в эту папку с заменой файлов и выполни команды обновления/релиза из раздела выше.
+
+## Проверка перед тегом
+
+Минимум проверь:
+
+- первый запуск EXE и автооткрытие интерфейса;
+- поиск и кнопку **Стоп**;
+- обновление/закрытие вкладки во время запроса и восстановление процесса;
+- восстановление готового результата после повторного открытия интерфейса;
+- карточку ФД и копирование значений;
+- пункт трея **Скопировать ссылку интерфейса**;
+- `Перезапустить` и `Завершить`.
