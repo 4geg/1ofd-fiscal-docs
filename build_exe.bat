@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==========================================
-echo  Сборка 1OFD Fiscal Docs v1.7.4
+echo  Сборка 1OFD Fiscal Docs v1.7.5
  echo ==========================================
 
 if not exist ".venv\Scripts\python.exe" (
@@ -32,9 +32,11 @@ if not exist "assets\app.ico" (
 )
 
 echo [5/5] Собираю EXE...
-pyinstaller --noconfirm --clean --onefile --windowed ^
+pyinstaller --noconfirm --clean --onefile --windowed --noupx ^
   --name "1OFD_FiscalDocs" ^
   --icon "assets\app.ico" ^
+  --version-file "assets\version_info.txt" ^
+  --manifest "assets\app.manifest" ^
   --add-data "assets\app.ico;assets" ^
   --collect-all uvicorn ^
   --collect-all fastapi ^
@@ -46,9 +48,12 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
   main.py
 if errorlevel 1 goto :error
 
+for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash 'dist\1OFD_FiscalDocs.exe' -Algorithm SHA256).Hash.ToLower()"') do echo %%H  1OFD_FiscalDocs.exe>"dist\SHA256SUMS.txt"
+
 echo.
 echo ГОТОВО.
 echo EXE: %CD%\dist\1OFD_FiscalDocs.exe
+echo SHA256: %CD%\dist\SHA256SUMS.txt
 explorer "%CD%\dist"
 pause
 exit /b 0

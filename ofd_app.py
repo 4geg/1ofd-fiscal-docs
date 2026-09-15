@@ -1946,7 +1946,7 @@ body{
 }
 .input::placeholder{color:#8ea3b4}
 .input:focus,.select:focus,.tokenbox:focus-within{
-  background:var(--surface-2);
+  background-color:var(--surface-2);
   box-shadow:0 0 0 3px rgba(0,119,182,.12), var(--shadow-soft);
 }
 .date-row{display:grid;grid-template-columns:1fr 104px;gap:8px}
@@ -2183,19 +2183,27 @@ body{
   align-items:center;
   background:linear-gradient(180deg,#ffffff 0%, #f5fafc 100%);
 }
+.export-actions{display:flex;align-items:center;gap:8px}
+.export-btn{height:38px;border:0;border-radius:999px;background:var(--surface-2);color:var(--blue-deep);padding:0 13px 0 15px;display:inline-flex;align-items:center;gap:8px;font:inherit;font-size:12px;font-weight:800;cursor:pointer;box-shadow:var(--shadow-soft);transition:background .12s ease,transform .12s ease,color .12s ease}
+.export-btn:hover{background:var(--blue-pale);color:var(--blue);transform:translateY(-1px)}
+.export-btn:active{transform:translateY(0)}
+.export-btn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .table-wrap{overflow:auto;max-height:64vh}
 table{border-collapse:separate;border-spacing:0 8px;width:100%;min-width:1850px;padding:0 10px 8px}
 th,td{padding:12px 10px;text-align:left;white-space:nowrap}
 th{
-  background:transparent;
+  background:#edf6fb;
   position:sticky;
   top:0;
-  z-index:2;
+  z-index:4;
   font-weight:800;
   color:#476179;
   cursor:pointer;
   user-select:none;
+  box-shadow:inset 0 -1px 0 rgba(71,97,121,.10),0 5px 10px rgba(22,50,74,.04);
 }
+thead th:first-child{border-top-left-radius:18px;border-bottom-left-radius:18px}
+thead th:last-child{border-top-right-radius:18px;border-bottom-right-radius:18px}
 th:hover{color:var(--blue-deep)}
 tbody tr{cursor:pointer;transition:transform .1s ease,filter .1s ease}
 tbody tr td{background:#f7fbfd}
@@ -2215,10 +2223,10 @@ tbody tr:hover td{background:#edf7fd}
 .pager button{border:0;background:var(--surface);color:var(--blue-deep);cursor:pointer;padding:10px 14px;border-radius:999px;box-shadow:var(--shadow-soft);font-weight:700}
 .pager button:disabled{color:#b5c4d0;cursor:default;box-shadow:none;background:#eef3f6}
 .page-size{margin-left:auto;display:flex;align-items:center;gap:8px;color:var(--muted);font-weight:600}
-.page-size select{height:40px;background:var(--surface);padding:0 40px 0 12px;background-position:right 14px center}
+.page-size select{height:40px;background-color:var(--surface);padding:0 40px 0 12px;background-position:right 14px center}
 .modal{display:none;position:fixed;inset:0;background:rgba(12,19,29,.36);z-index:100;align-items:center;justify-content:center;padding:20px}
 .modal.show{display:flex}
-.modal-box{width:min(1240px,97vw);max-height:92vh;overflow:auto;background:#fff;border-radius:30px;box-shadow:0 26px 70px rgba(22,57,85,.22)}
+.modal-box{width:min(1240px,97vw);max-height:92vh;overflow:hidden;background:#fff;border-radius:30px;box-shadow:0 26px 70px rgba(22,57,85,.22);display:flex;flex-direction:column}
 .modal-title{
   padding:20px 24px 8px;
   display:flex;
@@ -2227,12 +2235,20 @@ tbody tr:hover td{background:#edf7fd}
   font-size:18px;
   font-weight:800;
   color:var(--blue-deep);
+  flex:0 0 auto;
 }
 .detail-title-wrap{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.detail-title-actions{display:flex;align-items:center;gap:8px;margin-left:auto}
+.detail-open-tab{display:inline-flex;align-items:center;gap:7px;height:40px;padding:0 13px;background:var(--surface-2)}
+.detail-open-tab svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .detail-type-chip{display:inline-flex;align-items:center;gap:7px;background:var(--blue-pale);padding:7px 12px;border-radius:999px;font-size:12px;color:var(--blue-deep);font-weight:800}
 .detail-type-chip:before{content:'';width:8px;height:8px;border-radius:50%;background:var(--blue)}
 .close-x{border:0;background:var(--surface);width:44px;height:44px;border-radius:999px;font-size:22px;cursor:pointer;color:var(--muted);box-shadow:var(--shadow-soft)}
-.modal-body{padding:8px 20px 20px}
+.modal-body{padding:8px 14px 20px 20px;margin-right:6px;overflow-y:auto;overflow-x:hidden;max-height:calc(92vh - 72px);scrollbar-gutter:stable;overscroll-behavior:contain}
+.modal-body::-webkit-scrollbar{width:10px}
+.modal-body::-webkit-scrollbar-track{background:transparent}
+.modal-body::-webkit-scrollbar-thumb{background:#c6d9e6;border:2px solid #fff;border-radius:999px}
+.modal-body::-webkit-scrollbar-thumb:hover{background:#a9c7da}
 .details-grid{display:flex;flex-direction:column;gap:12px;margin-bottom:13px}
 .detail-section{background:linear-gradient(180deg,#eef8fe 0%,#e5f3fb 100%);padding:12px 14px 14px;border-radius:26px}
 .detail-section-title{display:flex;align-items:center;gap:8px;color:var(--blue-deep);font-size:14px;font-weight:800;margin:0 0 10px 2px}
@@ -2260,6 +2276,8 @@ tbody tr:hover td{background:#edf7fd}
 .detail-subfield small{margin:0 0 2px;color:var(--muted);font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.04em}
 .detail-address{padding-right:52px}
 .raw-details{margin-top:13px;background:var(--surface);border-radius:22px;overflow:hidden;box-shadow:var(--shadow-soft)}
+.extra-details .details-grid{padding:0 12px 12px;margin:0}
+.extra-details .detail-section{box-shadow:none}
 .raw-details summary{list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;font-weight:800;color:var(--blue-deep);user-select:none}
 .raw-details summary::-webkit-details-marker{display:none}
 .raw-details summary:after{content:'⌄';font-size:18px;transition:transform .15s ease}
@@ -2331,7 +2349,7 @@ pre{margin:0;background:#112031;color:#d8e2ec;border-radius:18px;padding:16px;ov
 </style>
 </head>
 <body>
-<div class="topbar"><div class="brand">Первый ОФД <span>• Фискальные документы</span></div><div class="topnote">локальное веб-приложение • Universal API</div><div class="topbar-actions"><span class="version-chip">v1.7.4</span><button id="apiKeyBtn" class="api-key-btn">API-ключ</button></div></div>
+<div class="topbar"><div class="brand">Первый ОФД <span>• Фискальные документы</span></div><div class="topnote">локальное веб-приложение • Universal API</div><div class="topbar-actions"><span class="version-chip">v1.7.5</span><button id="apiKeyBtn" class="api-key-btn">API-ключ</button></div></div>
 <div class="page">
 
   <section class="panel" id="apiPanel">
@@ -2440,7 +2458,7 @@ pre{margin:0;background:#112031;color:#d8e2ec;border-radius:18px;padding:16px;ov
   </section>
 
   <div class="results">
-    <div class="table-meta"><span id="tableInfo">Документов нет</span><span><button id="csvBtn" class="btn mini">CSV ⇩</button> <button id="jsonBtn" class="btn mini">JSON ⇩</button></span></div>
+    <div class="table-meta"><span id="tableInfo">Документов нет</span><div class="export-actions"><button id="csvBtn" class="export-btn" type="button"><span>CSV</span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5v9"></path><path d="m6.5 8.5 3.5 3.5 3.5-3.5"></path><path d="M4 15.5h12"></path></svg></button><button id="jsonBtn" class="export-btn" type="button"><span>JSON</span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5v9"></path><path d="m6.5 8.5 3.5 3.5 3.5-3.5"></path><path d="M4 15.5h12"></path></svg></button></div></div>
     <div class="table-wrap"><table><thead><tr>
       <th data-sort="date_sort">Дата и время ФД</th><th data-sort="kkm_internal_name">Внутреннее имя в ОФД</th><th data-sort="kkm_reg_id">РНМ</th><th data-sort="type">Тип ФД</th><th data-sort="shift">Смена</th><th data-sort="fd">ФД</th><th data-sort="amount">Сумма</th><th data-sort="fpd">ФПД</th><th data-sort="fs_number">ЗН ФН</th><th data-sort="kkm_factory_number">ЗН ККТ</th><th data-sort="fns_flc_status">Статус ФНС</th><th data-sort="inserted_at_sort">Поступил в ОФД</th><th data-sort="address">Адрес</th>
     </tr></thead><tbody id="rows"></tbody></table><div id="empty" class="empty">Сначала выполни запрос в Первый ОФД.</div></div>
@@ -2449,7 +2467,7 @@ pre{margin:0;background:#112031;color:#d8e2ec;border-radius:18px;padding:16px;ov
 </div>
 
 <div id="keyModal" class="modal"><div class="modal-box" style="width:min(760px,96vw)"><div class="modal-title">API-ключ Первого ОФД <button class="close-x" data-close="keyModal">×</button></div><div class="modal-body"><div id="keyList" class="key-list"></div><div class="key-add-grid"><div class="field"><label>Добавить новый API-ключ</label><div class="secret-wrap"><input id="newApiKey" class="input" type="password" autocomplete="off" placeholder="Вставьте API-ключ"><button id="toggleApiKey" class="secret-toggle" type="button" title="Показать / скрыть API-ключ" aria-label="Показать или скрыть API-ключ"><svg class="eye-on" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.8"/></svg><svg class="eye-off" viewBox="0 0 24 24"><path d="m3 3 18 18"/><path d="M10.6 6.2A10.9 10.9 0 0 1 12 6c6 0 9.5 6 9.5 6a15.5 15.5 0 0 1-3.1 3.7"/><path d="M6.4 6.4C3.9 8.2 2.5 12 2.5 12s3.5 6 9.5 6c1.2 0 2.3-.2 3.3-.6"/></svg></button></div></div><button id="addApiKeyBtn" class="btn primary">Проверить и сохранить</button></div><div id="keyError" class="key-error"></div><div class="key-note">Ключ проверяется через Universal API и сохраняется только на этом компьютере. В Windows он хранится в зашифрованном виде через DPAPI.</div></div></div></div>
-<div id="detailsModal" class="modal"><div class="modal-box"><div class="modal-title"><div class="detail-title-wrap"><span>Фискальный документ</span><span id="detailTypeChip" class="detail-type-chip">ФД</span></div><button class="close-x" data-close="detailsModal">×</button></div><div class="modal-body"><div id="detailsGrid" class="details-grid"></div><details class="raw-details"><summary>Полный ответ API</summary><div class="raw-content"><div class="raw-actions"><button id="copyJson" class="btn mini">Копировать JSON</button></div><pre id="rawJson"></pre></div></details></div></div></div><div id="copyToast" class="copy-toast">Скопировано</div>
+<div id="detailsModal" class="modal"><div class="modal-box"><div class="modal-title"><div class="detail-title-wrap"><span>Фискальный документ</span><span id="detailTypeChip" class="detail-type-chip">ФД</span></div><div class="detail-title-actions"><button id="openDetailTab" class="btn mini detail-open-tab" type="button" title="Открыть этот ФД в отдельной вкладке"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11 3h6v6"></path><path d="M17 3 9.5 10.5"></path><path d="M15 11.5V16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h4.5"></path></svg><span>В новой вкладке</span></button><button class="close-x" data-close="detailsModal">×</button></div></div><div class="modal-body"><div id="detailsGrid" class="details-grid"></div><details id="extraDetails" class="raw-details extra-details"><summary>Дополнительные данные ФД</summary><div id="extraDetailsGrid" class="details-grid"></div></details><details class="raw-details"><summary>Полный ответ API</summary><div class="raw-content"><div class="raw-actions"><button id="copyJson" class="btn mini">Копировать JSON</button></div><pre id="rawJson"></pre></div></details></div></div></div><div id="copyToast" class="copy-toast">Скопировано</div>
 <div id="failuresModal" class="modal"><div class="modal-box"><div class="modal-title">Непроверенные элементы <button class="close-x" data-close="failuresModal">×</button></div><div class="modal-body"><div id="failureSummary" style="margin-bottom:10px"></div><div id="failureList" class="failure-list"></div></div></div></div>
 
 <script>
@@ -2457,7 +2475,7 @@ const $=id=>document.getElementById(id);
 const TYPE_LABELS={registration:'Регистрация',reregistration:'Перерегистрация',close:'Закрытие ФН',ticket:'Кассовый чек',open_shift:'Открытие смены',close_shift:'Закрытие смены',receipt_correction:'Чек коррекции',bso:'БСО',bso_correction:'БСО коррекции'};
 const CORE_TYPES=new Set(['registration','reregistration','close']);
 const HEAVY_TYPES=new Set(['ticket','open_shift','close_shift','receipt_correction','bso','bso_correction']);
-let apiTerms=[],resultTerms=[],allRows=[],filteredRows=[],lastResponse=null,currentPage=1,sortState={key:'date_sort',dir:'desc'},statusTimer=null,currentRaw=null,currentDetailValues=[],keyState={active_id:null,profiles:[]},revealedKeys={};
+let apiTerms=[],resultTerms=[],allRows=[],filteredRows=[],lastResponse=null,currentPage=1,sortState={key:'date_sort',dir:'desc'},statusTimer=null,currentRaw=null,currentDetailRow=null,currentDetailValues=[],requestedDetailOpened=false,keyState={active_id:null,profiles:[]},revealedKeys={};
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function lc(v){return String(v??'').trim().toLowerCase()}
 function contains(v,n){return !n||lc(v).includes(lc(n))}
@@ -2507,7 +2525,7 @@ async function doSearch(){if(!hasActiveKey()){$('keyModal').classList.add('show'
 async function stopSearch(){const btn=$('stopSearchBtn');btn.disabled=true;$('statusText').textContent='Останавливаю запрос…';try{const res=await fetch('/api/stop-search',{method:'POST'});const data=await res.json();if(!res.ok)throw new Error(data.detail||'Не удалось остановить запрос');if(!data.stopping)$('statusText').textContent=data.message||'Активного запроса нет'}catch(e){btn.disabled=false;alert(e.message)}}
 async function restoreSession(){try{const session=await fetchSession();if(session.result)acceptResponse(session.result,true);if(session.request)applyRequestToUi(session.request);const s=session.status||{};if(s.running){$('statusText').textContent='Восстановлен активный запрос…';await watchSearch(true)}}catch(e){console.error('Не удалось восстановить состояние',e)}}
 function updateCompleteness(data){const c=data.completeness||{},box=$('completeness'),retry=$('retryBtn'),catalogRetry=$('catalogRetryBtn'),details=$('failedDetailsBtn');box.className='completeness show';if(c.full_coverage){box.classList.add('ok');$('completeTitle').textContent='Выборка полная по всем запланированным API-проверкам';$('completeSub').textContent=`Успешно ${c.successful_queries}/${c.planned_queries}. Каталог ККТ получен полностью. Дополнительно проверено неоднозначных ФН: ${data.uncertain_candidate_count||0}.`;retry.style.display='none';catalogRetry.style.display='none';details.style.display='none'}else if(c.all_planned_checks_complete&&!c.registration_coverage_complete){box.classList.add('warn');$('completeTitle').textContent='Все API-запросы выполнены, но поиск первичной регистрации имеет ограничение';$('completeSub').textContent=`У ${data.registration_unverifiable_count||0} ФН нет надёжной activationDate. Фильтруемые типы документов проверены, но для первичной регистрации по этим ФН нельзя гарантировать полноту без более тяжёлого полного сканирования.`;retry.style.display='none';catalogRetry.style.display='none';details.style.display='none'}else{box.classList.add(c.failed_queries>0?'bad':'warn');$('completeTitle').textContent='Результат может быть неполным';$('completeSub').textContent=`Документные запросы: ${c.successful_queries}/${c.planned_queries}; не проверено: ${c.failed_queries}. Не загружено мест установки: ${c.catalog_failed_places}.`;retry.style.display=c.failed_queries>0?'inline-block':'none';catalogRetry.style.display=c.catalog_failed_places>0?'inline-block':'none';details.style.display=(c.failed_queries>0||c.catalog_failed_places>0)?'inline-block':'none'}}
-function acceptResponse(data,resetLocal=false){lastResponse=data;allRows=data.rows||[];if(resetLocal){resultTerms=[];renderTokens('result');$('rDateFrom').value=data.period?.from||$('dateFrom').value;$('rDateTo').value=data.period?.to||$('dateTo').value;$('rTimeFrom').value=$('timeFrom').value||'00:00';$('rTimeTo').value=$('timeTo').value||'23:59';['rRnm','rKkt','rFn','rFd','rFpd','rShift','rInternal','rRetail','rAddress','rStatus'].forEach(id=>$(id).value='');document.querySelectorAll('.resultDocType').forEach(x=>x.checked=true)}updateCompleteness(data);applyClientFilters()}
+function acceptResponse(data,resetLocal=false){lastResponse=data;allRows=data.rows||[];if(resetLocal){resultTerms=[];renderTokens('result');$('rDateFrom').value=data.period?.from||$('dateFrom').value;$('rDateTo').value=data.period?.to||$('dateTo').value;$('rTimeFrom').value=$('timeFrom').value||'00:00';$('rTimeTo').value=$('timeTo').value||'23:59';['rRnm','rKkt','rFn','rFd','rFpd','rShift','rInternal','rRetail','rAddress','rStatus'].forEach(id=>$(id).value='');document.querySelectorAll('.resultDocType').forEach(x=>x.checked=true)}updateCompleteness(data);applyClientFilters();openRequestedDetail()}
 function rowSearchValues(r){return[r.date,r.inserted_at,r.type,r.raw_type,r.kkm_internal_name,r.kkm_reg_id,r.kkm_factory_number,r.fs_number,r.fd,r.fpd,r.shift,r.amount,r.fns_flc_status,r.fns_status,r.fns_description,r.retail_place,r.address].map(lc)}
 function rowMatchesTerms(r){if(!resultTerms.length)return true;const values=rowSearchValues(r);return resultTerms.some(term=>values.some(v=>v.includes(lc(term))))}
 function resultPeriodBounds(){const d1=$('rDateFrom').value,d2=$('rDateTo').value,t1=$('rTimeFrom').value||'00:00',t2=$('rTimeTo').value||'23:59';return{from:d1?`${d1}T${t1}:00`:'',to:d2?`${d2}T${t2}:59`:''}}
@@ -2523,16 +2541,18 @@ function plainField(label,value,cls=''){const text=String(value??'')||'—';retu
 function addressField(label,value,cls=''){const text=String(value??'')||'—',i=pushCopyValue(text);return `<div class="detail detail-address ${cls}"><small>${esc(label)}</small><div class="detail-value">${esc(text)}</div>${copyButtonHtml(i)}</div>`}
 function datetimeField(title,value,dateLabel='Дата',timeLabel='Время',cls=''){const dt=splitDisplayDateTime(value);if(!dt)return copyableField(title,value,cls);const dateI=pushCopyValue(dt.date||'—'),timeI=pushCopyValue(dt.time||'—');return `<div class="detail detail-datetime ${cls}"><span class="detail-datetime-title">${esc(title)}</span><div class="detail-datetime-fields"><div class="detail-subfield copyable" data-copy-index="${dateI}" title="Нажми, чтобы скопировать"><small>${esc(dateLabel)}</small><div class="detail-value">${esc(dt.date||'—')}</div></div><div class="detail-subfield copyable" data-copy-index="${timeI}" title="Нажми, чтобы скопировать"><small>${esc(timeLabel)}</small><div class="detail-value">${esc(dt.time||'—')}</div></div></div></div>`}
 function detailSection(title,icon,items){return `<section class="detail-section"><div class="detail-section-title"><span class="section-dot">${icon}</span><span>${esc(title)}</span></div><div class="detail-section-grid">${items.join('')}</div></section>`}
+function detailKey(r){return [r?.kkm_reg_id??'',r?.fs_number??'',r?.fd??'',r?.document_key??'',r?.date_sort??''].join('~')}
+function openCurrentDetailInNewTab(){if(!currentDetailRow)return;const url=new URL(window.location.origin+window.location.pathname);url.searchParams.set('doc',detailKey(currentDetailRow));window.open(url.toString(),'_blank','noopener')}
+function openRequestedDetail(){if(requestedDetailOpened||!allRows.length)return;const key=new URLSearchParams(window.location.search).get('doc');if(!key)return;const row=allRows.find(r=>detailKey(r)===key);if(row){requestedDetailOpened=true;showDetails(row)}}
 function showDetails(r){
   currentRaw=r.raw;
+  currentDetailRow=r;
   currentDetailValues=[];
   $('detailTypeChip').textContent=r.type||'ФД';
   const html=[];
-  html.push(detailSection('Ключевые даты и статус','◷',[
-    datetimeField('Дата и время ФД',r.date,'Дата ФД','Время ФД','wide'),
-    datetimeField('Поступление в ОФД',r.inserted_at,'Дата поступления','Время поступления','wide'),
-    copyableField('Статус ФЛК ФНС',r.fns_flc_status??'—','wide'),
-    copyableField('Код ФНС',r.fns_status??'—','wide')
+  html.push(detailSection('Основные данные ФД','◷',[
+    datetimeField('Дата и время ФД',r.date,'Дата ФД','Время ФД','xwide'),
+    copyableField('Сумма',r.amount??'—','wide')
   ]));
   html.push(detailSection('Основные идентификаторы','▣',[
     copyableField('РНМ',r.kkm_reg_id,'wide'),
@@ -2542,24 +2562,32 @@ function showDetails(r){
     copyableField('ФПД',r.fpd),
     copyableField('Смена',r.shift)
   ]));
-  html.push(detailSection('Место установки и информация','⌖',[
-    copyableField('Внутреннее имя в ОФД',r.kkm_internal_name,'wide'),
-    copyableField('Место установки',r.retail_place,'wide'),
-    addressField('Адрес',r.address,'wide')
+  html.push(detailSection('Место расчётов','⌖',[
+    copyableField('Место установки',r.retail_place,'xwide'),
+    addressField('Адрес',r.address,'xwide')
   ]));
-  html.push(detailSection('Жизненный цикл и дополнительные данные','◴',[
+  html.push(detailSection('Данные ФН','◴',[
     datetimeField('Активация ФН',r.activation_date,'Дата','Время','wide'),
     datetimeField('Срок ФН',r.expire_date,'Дата','Время','wide'),
-    datetimeField('Закрытие архива',r.close_archive_date,'Дата','Время','wide'),
-    copyableField('Сумма',r.amount??'—','wide')
+    datetimeField('Закрытие архива',r.close_archive_date,'Дата','Время','wide')
   ]));
-  html.push(detailSection('Техническая информация','⚙',[
+  $('detailsGrid').innerHTML=html.join('');
+
+  const extra=[];
+  extra.push(detailSection('Служебные данные ОФД и ФНС','◷',[
+    datetimeField('Поступление в ОФД',r.inserted_at,'Дата поступления','Время поступления','wide'),
+    copyableField('Статус ФЛК ФНС',r.fns_flc_status??'—','wide'),
+    copyableField('Код ФНС',r.fns_status??'—','wide'),
+    copyableField('Внутреннее имя в ОФД',r.kkm_internal_name,'xwide')
+  ]));
+  extra.push(detailSection('Техническая информация','⚙',[
     copyableField('Подтверждение ФНС',typeof r.fns_confirmation==='object'?JSON.stringify(r.fns_confirmation):r.fns_confirmation,'xwide'),
     copyableField('Описание ФНС',r.fns_description??'—','xwide')
   ]));
-  $('detailsGrid').innerHTML=html.join('');
+  $('extraDetailsGrid').innerHTML=extra.join('');
   $('rawJson').textContent=JSON.stringify(r.raw,null,2);
-  const rawDetails=document.querySelector('#detailsModal .raw-details');if(rawDetails)rawDetails.open=false;
+  const extraDetails=$('extraDetails');if(extraDetails)extraDetails.open=false;
+  const rawDetails=document.querySelector('#detailsModal .raw-details:not(.extra-details)');if(rawDetails)rawDetails.open=false;
   $('detailsModal').classList.add('show');
 }
 function showCopyToast(text='Скопировано'){const t=$('copyToast');t.textContent=text;t.classList.add('show');clearTimeout(showCopyToast.timer);showCopyToast.timer=setTimeout(()=>t.classList.remove('show'),900)}
@@ -2572,7 +2600,7 @@ function resetLocal(){resultTerms=[];renderTokens('result');$('rDateFrom').value
 function initDates(){const now=new Date(),localNow=new Date(now.getTime()-now.getTimezoneOffset()*60000),today=localNow.toISOString().slice(0,10),first=`${today.slice(0,8)}01`;$('dateFrom').value=first;$('dateTo').value=today;$('rDateFrom').value=first;$('rDateTo').value=today}
 
 bindTokenInput('api');bindTokenInput('result');initDates();renderTokens('api');renderTokens('result');
-$('stopSearchBtn').onclick=stopSearch;$('detailsGrid').addEventListener('click',async e=>{const target=e.target.closest('[data-copy-index]');if(!target)return;const i=Number(target.dataset.copyIndex),ok=await copyText(currentDetailValues[i]??'');if(ok){target.classList.add('copied');showCopyToast();setTimeout(()=>target.classList.remove('copied'),850)}else{showCopyToast('Не удалось скопировать')}});$('apiAdvancedBtn').onclick=()=>toggleAdvanced('apiAdvanced','apiAdvancedBtn');$('resultAdvancedBtn').onclick=()=>toggleAdvanced('resultAdvanced','resultAdvancedBtn');$('searchBtn').onclick=doSearch;$('applyResultBtn').onclick=applyClientFilters;$('retryBtn').onclick=retryFailed;$('catalogRetryBtn').onclick=()=>{$('qRefresh').checked=true;doSearch()};$('failedDetailsBtn').onclick=showFailures;$('csvBtn').onclick=downloadCSV;$('jsonBtn').onclick=downloadJSON;$('apiCoreTypes').onclick=()=>setChecks('.apiDocType','core');$('apiAllTypes').onclick=()=>setChecks('.apiDocType','all');$('apiNoTypes').onclick=()=>setChecks('.apiDocType','none');$('resultAllTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=true);applyClientFilters()};$('resultNoTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=false);applyClientFilters()};$('resetResultFilters').onclick=resetLocal;$('pageSize').onchange=()=>{currentPage=1;render()};$('firstPage').onclick=()=>{currentPage=1;render()};$('prevPage').onclick=()=>{currentPage=Math.max(1,currentPage-1);render()};$('nextPage').onclick=()=>{currentPage++;render()};$('lastPage').onclick=()=>{currentPage=Math.max(1,Math.ceil(filteredRows.length/pageSizeValue()));render()};document.querySelectorAll('[data-close]').forEach(x=>x.onclick=()=>$(x.dataset.close).classList.remove('show'));document.querySelectorAll('.modal').forEach(m=>m.onclick=e=>{if(e.target===m)m.classList.remove('show')});$('copyJson').onclick=async()=>{await navigator.clipboard.writeText(JSON.stringify(currentRaw,null,2));$('copyJson').textContent='Скопировано';setTimeout(()=>$('copyJson').textContent='Копировать JSON',900)};document.querySelectorAll('th[data-sort]').forEach(th=>th.onclick=()=>{const key=th.dataset.sort;if(sortState.key===key)sortState.dir=sortState.dir==='asc'?'desc':'asc';else{sortState.key=key;sortState.dir='asc'}applyClientFilters()});
+$('stopSearchBtn').onclick=stopSearch;$('detailsModal').addEventListener('click',async e=>{const target=e.target.closest('[data-copy-index]');if(!target)return;const i=Number(target.dataset.copyIndex),ok=await copyText(currentDetailValues[i]??'');if(ok){target.classList.add('copied');showCopyToast();setTimeout(()=>target.classList.remove('copied'),850)}else{showCopyToast('Не удалось скопировать')}});$('openDetailTab').onclick=openCurrentDetailInNewTab;$('apiAdvancedBtn').onclick=()=>toggleAdvanced('apiAdvanced','apiAdvancedBtn');$('resultAdvancedBtn').onclick=()=>toggleAdvanced('resultAdvanced','resultAdvancedBtn');$('searchBtn').onclick=doSearch;$('applyResultBtn').onclick=applyClientFilters;$('retryBtn').onclick=retryFailed;$('catalogRetryBtn').onclick=()=>{$('qRefresh').checked=true;doSearch()};$('failedDetailsBtn').onclick=showFailures;$('csvBtn').onclick=downloadCSV;$('jsonBtn').onclick=downloadJSON;$('apiCoreTypes').onclick=()=>setChecks('.apiDocType','core');$('apiAllTypes').onclick=()=>setChecks('.apiDocType','all');$('apiNoTypes').onclick=()=>setChecks('.apiDocType','none');$('resultAllTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=true);applyClientFilters()};$('resultNoTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=false);applyClientFilters()};$('resetResultFilters').onclick=resetLocal;$('pageSize').onchange=()=>{currentPage=1;render()};$('firstPage').onclick=()=>{currentPage=1;render()};$('prevPage').onclick=()=>{currentPage=Math.max(1,currentPage-1);render()};$('nextPage').onclick=()=>{currentPage++;render()};$('lastPage').onclick=()=>{currentPage=Math.max(1,Math.ceil(filteredRows.length/pageSizeValue()));render()};document.querySelectorAll('[data-close]').forEach(x=>x.onclick=()=>$(x.dataset.close).classList.remove('show'));document.querySelectorAll('.modal').forEach(m=>m.onclick=e=>{if(e.target===m)m.classList.remove('show')});$('copyJson').onclick=async()=>{await navigator.clipboard.writeText(JSON.stringify(currentRaw,null,2));$('copyJson').textContent='Скопировано';setTimeout(()=>$('copyJson').textContent='Копировать JSON',900)};document.querySelectorAll('th[data-sort]').forEach(th=>th.onclick=()=>{const key=th.dataset.sort;if(sortState.key===key)sortState.dir=sortState.dir==='asc'?'desc':'asc';else{sortState.key=key;sortState.dir='asc'}applyClientFilters()});
 ['timeFrom','timeTo','qRnm','qKkt','qFn','qInternal','qRetail','qAddress','qShift','qConcurrency'].forEach(id=>$(id).addEventListener('input',updateApiSummary));document.querySelectorAll('.apiDocType,.apiStatus').forEach(x=>x.addEventListener('change',updateApiSummary));['rDateFrom','rDateTo','rTimeFrom','rTimeTo'].forEach(id=>$(id).addEventListener('change',applyClientFilters));
 $('toggleApiKey').onclick=()=>{const input=$('newApiKey'),btn=$('toggleApiKey'),show=input.type==='password';input.type=show?'text':'password';btn.classList.toggle('visible',show);btn.setAttribute('aria-pressed',show?'true':'false')};
 $('apiKeyBtn').onclick=()=>{$('keyModal').classList.add('show');loadKeys(false)};$('addApiKeyBtn').onclick=addApiKey;$('newApiKey').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addApiKey()}});$('keyList').addEventListener('click',e=>{const s=e.target.closest('.key-select'),d=e.target.closest('.key-delete'),r=e.target.closest('.key-reveal');if(s)selectKey(s.dataset.id);if(d)deleteKey(d.dataset.id);if(r)toggleRevealKey(r.dataset.id)});loadKeys(true);
