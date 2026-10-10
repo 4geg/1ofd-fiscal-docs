@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 7, 5, 0),
-    prodvers=(1, 7, 5, 0),
+    filevers=(1, 7, 7, 0),
+    prodvers=(1, 7, 7, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', '4geg'),
           StringStruct('FileDescription', '1OFD Fiscal Docs — фискальные документы Первого ОФД'),
-          StringStruct('FileVersion', '1.7.5'),
+          StringStruct('FileVersion', '1.7.7'),
           StringStruct('InternalName', '1OFD_FiscalDocs'),
           StringStruct('LegalCopyright', '4geg'),
           StringStruct('OriginalFilename', '1OFD_FiscalDocs.exe'),
           StringStruct('ProductName', '1OFD Fiscal Docs'),
-          StringStruct('ProductVersion', '1.7.5')
+          StringStruct('ProductVersion', '1.7.7')
         ]
       )
     ]),

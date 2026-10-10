@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import socket
 import subprocess
@@ -10,7 +11,6 @@ import sys
 import threading
 import time
 import urllib.request
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +18,9 @@ import pystray
 import uvicorn
 from PIL import Image, ImageDraw, ImageFont
 
-from config_store import APP_DATA_DIR, LOG_DIR
-from ofd_app import app
-from version import APP_DISPLAY_NAME, VERSION, HOST, PORT
+from config_store import APP_DATA_DIR, LOG_DIR, LOAD_PROFILES, RUNTIME_SETTING_CHOICES, get_load_profile, get_runtime_settings, set_runtime_setting, MANUAL_SETTING_LABELS, STORAGE_MODE_NAMES, register_settings_listener
+from resource_bundle import ensure_resources
+from version import APP_NAME, APP_DISPLAY_NAME, VERSION, HOST, PORT
 
 LOGGER = logging.getLogger("ofd_app")
 SERVER: uvicorn.Server | None = None
@@ -33,38 +33,200 @@ RUNTIME_FILE = APP_DATA_DIR / "runtime.json"
 SERVER_FAILED = threading.Event()
 SERVER_STOPPED = threading.Event()
 RESTART_LOCK = threading.Lock()
+SERVER_SOCKET: socket.socket | None = None
+APP_INSTANCE_ID: str | None = None
+app: Any = None
+
+
+class SizeLimitedLogHandler(RotatingFileHandler):
+    """Keep an active log and two previous logs, limited by UTF-8 byte size."""
+    def __init__(self, filename: Path, limit_mb: int):
+        super().__init__(filename, maxBytes=limit_mb * 1024 * 1024,
+                         backupCount=2, encoding="utf-8")
+        self.limit_bytes = limit_mb * 1024 * 1024
+        self.set_limit(limit_mb)
+
+    def _open(self):
+        # Disable CRLF translation so the encoded byte count is exact on Windows.
+        return open(self.baseFilename, self.mode, encoding=self.encoding, errors="replace", newline="")
+
+    def _trim_tail(self, filename: Path) -> None:
+        if not filename.exists() or filename.stat().st_size <= self.limit_bytes:
+            return
+        # A smaller tray limit takes effect on existing files too. Keep their
+        # newest records; memory used here is bounded by the selected file limit.
+        with filename.open("rb") as source:
+            source.seek(-self.limit_bytes, os.SEEK_END)
+            tail = source.read(self.limit_bytes)
+        newline = tail.find(b"\n")
+        tail = tail[newline + 1:] if newline >= 0 else tail.decode("utf-8", errors="ignore").encode("utf-8")
+        temporary = filename.with_name(filename.name + ".limit.tmp")
+        try:
+            temporary.write_bytes(tail)
+            os.replace(temporary, filename)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def set_limit(self, limit_mb: int) -> None:
+        self.acquire()
+        try:
+            self.limit_bytes = limit_mb * 1024 * 1024
+            self.maxBytes = self.limit_bytes
+            if self.stream:
+                self.stream.flush()
+                self.stream.close()
+                self.stream = None
+            for suffix in ("", ".1", ".2"):
+                self._trim_tail(Path(self.baseFilename + suffix))
+        finally:
+            self.release()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            # Bound even a single huge exception/API error before writing it.
+            encoded = (self.format(record) + self.terminator).encode("utf-8", errors="replace")
+            if len(encoded) > 16 * 1024:
+                marker = b"\n[log entry truncated]\n"
+                encoded = encoded[:16 * 1024 - len(marker)].decode("utf-8", errors="ignore").encode("utf-8") + marker
+            if self.stream is None:
+                self.stream = self._open()
+            if os.fstat(self.stream.fileno()).st_size + len(encoded) > self.limit_bytes:
+                self.doRollover()
+            self.stream.write(encoded.decode("utf-8"))
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / "app.log"
-    handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=4, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"))
     root = logging.getLogger()
+    if any(isinstance(h, SizeLimitedLogHandler) for h in root.handlers):
+        return
+    # Preserve the two newest archives across restarts; remove older legacy ones.
+    for old in LOG_DIR.glob("app.log.*"):
+        suffix = old.name.removeprefix("app.log.")
+        if suffix.isdigit() and int(suffix) > 2:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    handler = SizeLimitedLogHandler(log_file, get_runtime_settings()["log_limit_mb"])
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"))
     root.setLevel(logging.INFO)
-    if not any(isinstance(h, RotatingFileHandler) for h in root.handlers):
-        root.addHandler(handler)
+    root.addHandler(handler)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def _setting_action(key: str, value: int | str):
+    def worker(icon: pystray.Icon) -> None:
+        try:
+            set_runtime_setting(key, value)
+            if key == "log_limit_mb":
+                for handler in logging.getLogger().handlers:
+                    if isinstance(handler, SizeLimitedLogHandler):
+                        handler.set_limit(value)
+            icon.update_menu()
+            if key == "load_profile":
+                profile = get_load_profile()
+                message = f"{profile['name']}: до {profile['concurrency_cap']} обращений; кэш индекса {profile['sqlite_cache_mb']} МБ. Применяется к следующему поиску; просмотр — сразу."
+            elif key == "log_limit_mb":
+                message = f"Размер журнала на файл: {value} МБ. Сохраняются 3 файла."
+            else:
+                message = "Ручные настройки сохранены. Профиль помечен как изменённый вручную. Новые поиски используют эти значения."
+            _notify("1OFD Fiscal Docs", message)
+        except Exception:
+            LOGGER.exception("Не удалось сохранить настройку трея")
+            _notify("1OFD Fiscal Docs", "Не удалось сохранить настройку. Откройте журнал.")
+    def action(icon: pystray.Icon, item: Any) -> None:
+        threading.Thread(target=worker, args=(icon,), name="tray-setting", daemon=True).start()
+    return action
+
+
+def _refresh_tray_settings() -> None:
+    if TRAY is not None:
+        TRAY.update_menu()
+
+
+register_settings_listener(_refresh_tray_settings)
+
+
+def _manual_settings_action(field: str = "all"):
+    def action(icon: pystray.Icon, item: Any) -> None:
+        def worker() -> None:
+            if wait_for_server(CURRENT_WEB_URL, timeout=5, instance_id=APP_INSTANCE_ID):
+                _open_url_windows(CURRENT_WEB_URL + "/?load-settings=" + field)
+        threading.Thread(target=worker, name="tray-manual-settings", daemon=True).start()
+    return action
+
+
+def _settings_menu() -> pystray.Menu:
+    def selected(key: str, value: int | str):
+        return lambda item: get_runtime_settings()[key] == value
+
+    def choices(key: str, unit: str = "") -> pystray.Menu:
+        items = [pystray.MenuItem(
+            (STORAGE_MODE_NAMES[value] if key == "storage_mode" else f"{value} {unit}".strip()),
+            _setting_action(key, value), radio=True, checked=selected(key, value),
+        ) for value in RUNTIME_SETTING_CHOICES[key]]
+        if key not in ("storage_mode", "log_limit_mb"):
+            items.extend([pystray.Menu.SEPARATOR,
+                          pystray.MenuItem("Ввести другое число…", _manual_settings_action(key))])
+        return pystray.Menu(*items)
+
+    def preset_caption(item: Any) -> str:
+        profile = get_load_profile()
+        suffix = " (изменён вручную)" if profile["manual_modified"] else ""
+        return f"Профиль нагрузки: {profile['name']}{suffix}"
+
+    def manual_caption(key: str):
+        def caption(item: Any) -> str:
+            value = get_runtime_settings()[key]
+            if key == "storage_mode":
+                value = STORAGE_MODE_NAMES[value]
+            return f"{MANUAL_SETTING_LABELS[key]}: {value}"
+        return caption
+
+    descriptions = {"economy": "меньше нагрузки", "normal": "ответы на диск",
+                    "performance": "часть ответов в памяти", "maximum": "больше расход памяти"}
+    return pystray.Menu(
+        pystray.MenuItem(lambda item: f"Размер журнала (на файл): {get_runtime_settings()['log_limit_mb']} МБ", choices("log_limit_mb", "МБ")),
+        pystray.MenuItem(preset_caption, pystray.Menu(*(
+            pystray.MenuItem(f"{p['name']} — {descriptions[key]}", _setting_action("load_profile", key),
+                            radio=True, checked=selected("load_profile", key))
+            for key, p in LOAD_PROFILES.items()
+        ))),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Ручные настройки", pystray.Menu(
+            pystray.MenuItem("Открыть форму настроек…", _manual_settings_action()),
+            pystray.Menu.SEPARATOR,
+            *(pystray.MenuItem(manual_caption(key), choices(key)) for key in MANUAL_SETTING_LABELS),
+        )),
+    )
 
 
 def _health_url(base_url: str) -> str:
     return base_url.rstrip("/") + "/api/health"
 
 
-def is_server_ready(base_url: str | None = None, timeout: float = 0.7) -> bool:
+def is_server_ready(base_url: str | None = None, timeout: float = 0.7, instance_id: str | None = None) -> bool:
     url = _health_url(base_url or CURRENT_WEB_URL)
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
-            return response.status == 200
+            payload = json.loads(response.read(8192))
+            return response.status == 200 and payload.get("ok") is True and payload.get("app") == APP_NAME and (instance_id is None or payload.get("instance_id") == instance_id)
     except Exception:
         return False
 
 
-def wait_for_server(base_url: str | None = None, timeout: float = 25.0) -> bool:
+def wait_for_server(base_url: str | None = None, timeout: float = 25.0, instance_id: str | None = None) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if SERVER_FAILED.is_set():
             return False
-        if is_server_ready(base_url):
+        if is_server_ready(base_url, instance_id=instance_id):
             return True
         time.sleep(0.2)
     return False
@@ -105,7 +267,7 @@ def _notify(title: str, message: str) -> None:
 def _open_web_worker(url: str | None = None, startup: bool = False) -> None:
     target = url or CURRENT_WEB_URL
     timeout = 30.0 if startup else 5.0
-    if wait_for_server(target, timeout=timeout):
+    if wait_for_server(target, timeout=timeout, instance_id=APP_INSTANCE_ID):
         # Небольшая пауза после первого успешного health-check снижает шанс гонки
         # между готовностью сокета и полной инициализацией браузерного UI.
         if startup:
@@ -231,14 +393,14 @@ def _resource_path(relative: str) -> Path:
 
 
 def create_tray_image() -> Image.Image:
-    # Используем ту же иконку, что у EXE. Fallback оставлен для разработки,
-    # если assets/app.ico отсутствует.
-    icon_path = _resource_path("assets/app.ico")
+    executable_dir = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+    custom = executable_dir / "app.ico"
+    icon_path = custom if custom.is_file() else APP_DATA_DIR / "resources/app.ico"
     try:
         if icon_path.exists():
             return Image.open(icon_path).convert("RGBA")
     except Exception:
-        LOGGER.exception("Не удалось загрузить assets/app.ico для трея")
+        LOGGER.exception("Не удалось загрузить иконку для трея")
 
     size = 64
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -257,30 +419,30 @@ def create_tray_image() -> Image.Image:
     return image
 
 
-def _port_is_free(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind((HOST, port))
-            return True
-        except OSError:
-            return False
-
-
 def choose_port(preferred: int | None = None) -> int:
+    global SERVER_SOCKET
     candidates: list[int] = []
     if preferred is not None:
         candidates.append(preferred)
     candidates.extend(p for p in range(PORT, PORT + 20) if p not in candidates)
     for candidate in candidates:
-        if _port_is_free(candidate):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if os.name == "nt":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            sock.bind((HOST, candidate))
+            sock.listen(128)
+            sock.setblocking(False)
+            SERVER_SOCKET = sock
             return candidate
+        except OSError:
+            sock.close()
     raise RuntimeError(f"Не найден свободный локальный порт в диапазоне {PORT}-{PORT + 19}")
 
 
 def _write_runtime_file(port: int) -> None:
     APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"pid": os.getpid(), "port": port, "url": f"http://{HOST}:{port}", "version": VERSION}
+    payload = {"pid": os.getpid(), "port": port, "url": f"http://{HOST}:{port}", "version": VERSION, "instance_id": APP_INSTANCE_ID}
     tmp = RUNTIME_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(RUNTIME_FILE)
@@ -304,8 +466,8 @@ def _remove_runtime_file() -> None:
         pass
 
 
-def start_server(port: int) -> None:
-    global SERVER
+def start_server(port: int, reserved_socket: socket.socket) -> None:
+    global SERVER, SERVER_SOCKET
     SERVER_FAILED.clear()
     SERVER_STOPPED.clear()
     try:
@@ -325,18 +487,24 @@ def start_server(port: int) -> None:
         server = uvicorn.Server(config)
         SERVER = server
         LOGGER.info("Запуск веб-сервера http://%s:%s", HOST, port)
-        server.run()
+        # Keep the bound socket: no gap between a free-port check and Uvicorn.
+        server.run(sockets=[reserved_socket])
     except BaseException:
         SERVER_FAILED.set()
         LOGGER.exception("Критическая ошибка веб-сервера")
     finally:
+        reserved_socket.close()
+        if SERVER_SOCKET is reserved_socket:
+            SERVER_SOCKET = None
         SERVER_STOPPED.set()
         LOGGER.info("Поток веб-сервера завершён")
 
 
 def _launch_server(port: int) -> None:
     global SERVER_THREAD
-    SERVER_THREAD = threading.Thread(target=start_server, args=(port,), name="uvicorn", daemon=True)
+    if SERVER_SOCKET is None:
+        raise RuntimeError("Порт сервера не зарезервирован")
+    SERVER_THREAD = threading.Thread(target=start_server, args=(port, SERVER_SOCKET), name="uvicorn", daemon=True)
     SERVER_THREAD.start()
 
 
@@ -381,7 +549,7 @@ def _restart_worker() -> None:
         _write_runtime_file(CURRENT_PORT)
         _launch_server(CURRENT_PORT)
 
-        if wait_for_server(CURRENT_WEB_URL, timeout=25.0):
+        if wait_for_server(CURRENT_WEB_URL, timeout=25.0, instance_id=APP_INSTANCE_ID):
             LOGGER.info("Веб-сервер успешно перезапущен")
             _open_url_windows(CURRENT_WEB_URL)
         else:
@@ -448,8 +616,16 @@ def _tray_setup(icon: pystray.Icon) -> None:
 
 
 def main() -> None:
-    global TRAY, CURRENT_PORT, CURRENT_WEB_URL
+    global TRAY, CURRENT_PORT, CURRENT_WEB_URL, app, APP_INSTANCE_ID
+    # Only the owner process writes app.log; a second launch just opens its UI.
+    if not acquire_single_instance():
+        _open_existing_instance()
+        return
     setup_logging()
+    ensure_resources(APP_DATA_DIR)
+    # Loading last_search.json is reserved for the owner, not each second launch.
+    from ofd_app import APP_INSTANCE_ID as instance_id, app as web_app
+    app, APP_INSTANCE_ID = web_app, instance_id
     LOGGER.info(
         "==== START %s v%s pid=%s frozen=%s ====",
         APP_DISPLAY_NAME,
@@ -457,10 +633,6 @@ def main() -> None:
         os.getpid(),
         getattr(sys, "frozen", False),
     )
-
-    if not acquire_single_instance():
-        _open_existing_instance()
-        return
 
     CURRENT_PORT = PORT
     CURRENT_WEB_URL = f"http://{HOST}:{CURRENT_PORT}"
@@ -470,6 +642,7 @@ def main() -> None:
         pystray.MenuItem("Скопировать ссылку интерфейса", copy_interface_url),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Перезапустить", restart_app),
+        pystray.MenuItem("Настройки", _settings_menu()),
         pystray.MenuItem("Открыть журнал", open_log),
         pystray.MenuItem("Папка данных", open_data_folder),
         pystray.Menu.SEPARATOR,
