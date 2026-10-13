@@ -18,7 +18,7 @@ import pystray
 import uvicorn
 from PIL import Image, ImageDraw, ImageFont
 
-from config_store import APP_DATA_DIR, LOG_DIR, LOAD_PROFILES, RUNTIME_SETTING_CHOICES, get_load_profile, get_runtime_settings, set_runtime_setting, MANUAL_SETTING_LABELS, STORAGE_MODE_NAMES, register_settings_listener
+from config_store import APP_DATA_DIR, LOG_DIR, get_runtime_settings, register_settings_listener
 from resource_bundle import ensure_resources
 from version import APP_NAME, APP_DISPLAY_NAME, VERSION, HOST, PORT
 
@@ -53,7 +53,7 @@ class SizeLimitedLogHandler(RotatingFileHandler):
     def _trim_tail(self, filename: Path) -> None:
         if not filename.exists() or filename.stat().st_size <= self.limit_bytes:
             return
-        # A smaller tray limit takes effect on existing files too. Keep their
+        # A smaller settings limit takes effect on existing files too. Keep their
         # newest records; memory used here is bounded by the selected file limit.
         with filename.open("rb") as source:
             source.seek(-self.limit_bytes, os.SEEK_END)
@@ -120,91 +120,54 @@ def setup_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def _setting_action(key: str, value: int | str):
-    def worker(icon: pystray.Icon) -> None:
+def _apply_runtime_log_settings() -> None:
+    limit = get_runtime_settings()["log_limit_mb"]
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, SizeLimitedLogHandler) and handler.limit_bytes != limit * 1024 * 1024:
+            handler.set_limit(limit)
+
+
+register_settings_listener(_apply_runtime_log_settings)
+
+
+def _history_caption(item: Any) -> str:
+    module = sys.modules.get("ofd_app")
+    if module is None:
+        return "История запросов"
+    # Never block the native tray/exit callback on SQL inspections or GC locks.
+    info = module.HISTORY_LAST_INFO
+    size = "<0,001" if info.get("used_bytes", 0) and info["used_gb"] < .001 else f"{info['used_gb']:.3f}".replace(".", ",")
+    return f"Сейчас занято: {size} ГБ, результатов запросов: {info['snapshots']}"
+
+
+def clear_history(icon=None, item=None) -> None:
+    def worker() -> None:
+        if os.name != "nt":
+            _open_url_windows(CURRENT_WEB_URL + "/?settings=history")
+            return
+        answer = ctypes.windll.user32.MessageBoxW(None,
+            "Удалить все результаты запросов?\n\nТекущий результат тоже будет удалён. "
+            "Активный запрос будет остановлен. Восстановить удалённые результаты нельзя.", APP_NAME, 4 | 32 | 256)
+        if answer != 6:
+            return
         try:
-            set_runtime_setting(key, value)
-            if key == "log_limit_mb":
-                for handler in logging.getLogger().handlers:
-                    if isinstance(handler, SizeLimitedLogHandler):
-                        handler.set_limit(value)
-            icon.update_menu()
-            if key == "load_profile":
-                profile = get_load_profile()
-                message = f"{profile['name']}: до {profile['concurrency_cap']} обращений; кэш индекса {profile['sqlite_cache_mb']} МБ. Применяется к следующему поиску; просмотр — сразу."
-            elif key == "log_limit_mb":
-                message = f"Размер журнала на файл: {value} МБ. Сохраняются 3 файла."
-            else:
-                message = "Ручные настройки сохранены. Профиль помечен как изменённый вручную. Новые поиски используют эти значения."
-            _notify("1OFD Fiscal Docs", message)
-        except Exception:
-            LOGGER.exception("Не удалось сохранить настройку трея")
-            _notify("1OFD Fiscal Docs", "Не удалось сохранить настройку. Откройте журнал.")
-    def action(icon: pystray.Icon, item: Any) -> None:
-        threading.Thread(target=worker, args=(icon,), name="tray-setting", daemon=True).start()
-    return action
-
-
-def _refresh_tray_settings() -> None:
-    if TRAY is not None:
-        TRAY.update_menu()
-
-
-register_settings_listener(_refresh_tray_settings)
-
-
-def _manual_settings_action(field: str = "all"):
-    def action(icon: pystray.Icon, item: Any) -> None:
-        def worker() -> None:
-            if wait_for_server(CURRENT_WEB_URL, timeout=5, instance_id=APP_INSTANCE_ID):
-                _open_url_windows(CURRENT_WEB_URL + "/?load-settings=" + field)
-        threading.Thread(target=worker, name="tray-manual-settings", daemon=True).start()
-    return action
-
-
-def _settings_menu() -> pystray.Menu:
-    def selected(key: str, value: int | str):
-        return lambda item: get_runtime_settings()[key] == value
-
-    def choices(key: str, unit: str = "") -> pystray.Menu:
-        items = [pystray.MenuItem(
-            (STORAGE_MODE_NAMES[value] if key == "storage_mode" else f"{value} {unit}".strip()),
-            _setting_action(key, value), radio=True, checked=selected(key, value),
-        ) for value in RUNTIME_SETTING_CHOICES[key]]
-        if key not in ("storage_mode", "log_limit_mb"):
-            items.extend([pystray.Menu.SEPARATOR,
-                          pystray.MenuItem("Ввести другое число…", _manual_settings_action(key))])
-        return pystray.Menu(*items)
-
-    def preset_caption(item: Any) -> str:
-        profile = get_load_profile()
-        suffix = " (изменён вручную)" if profile["manual_modified"] else ""
-        return f"Профиль нагрузки: {profile['name']}{suffix}"
-
-    def manual_caption(key: str):
-        def caption(item: Any) -> str:
-            value = get_runtime_settings()[key]
-            if key == "storage_mode":
-                value = STORAGE_MODE_NAMES[value]
-            return f"{MANUAL_SETTING_LABELS[key]}: {value}"
-        return caption
-
-    descriptions = {"economy": "меньше нагрузки", "normal": "ответы на диск",
-                    "performance": "часть ответов в памяти", "maximum": "больше расход памяти"}
-    return pystray.Menu(
-        pystray.MenuItem(lambda item: f"Размер журнала (на файл): {get_runtime_settings()['log_limit_mb']} МБ", choices("log_limit_mb", "МБ")),
-        pystray.MenuItem(preset_caption, pystray.Menu(*(
-            pystray.MenuItem(f"{p['name']} — {descriptions[key]}", _setting_action("load_profile", key),
-                            radio=True, checked=selected("load_profile", key))
-            for key, p in LOAD_PROFILES.items()
-        ))),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Ручные настройки", pystray.Menu(
-            pystray.MenuItem("Открыть форму настроек…", _manual_settings_action()),
-            pystray.Menu.SEPARATOR,
-            *(pystray.MenuItem(manual_caption(key), choices(key)) for key in MANUAL_SETTING_LABELS),
-        )),
-    )
+            if not is_server_ready(instance_id=APP_INSTANCE_ID):
+                raise ValueError("Веб-сервер недоступен. Откройте интерфейс и повторите очистку.")
+            request = urllib.request.Request(CURRENT_WEB_URL + "/api/history/clear",
+                data=b'{"confirmed":true}', headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    data = json.load(response)
+            except urllib.error.HTTPError as error:
+                data = json.load(error)
+                raise ValueError(data.get("detail") or "Не удалось очистить историю") from error
+            _notify(APP_NAME, data["message"])
+            if TRAY:
+                TRAY.update_menu()
+        except Exception as error:
+            LOGGER.exception("Не удалось очистить историю из трея")
+            _notify(APP_NAME, str(error))
+    threading.Thread(target=worker, name="tray-clear-history", daemon=True).start()
 
 
 def _health_url(base_url: str) -> str:
@@ -564,11 +527,39 @@ def restart_app(*_args: Any) -> None:
 
 
 def exit_app(icon=None, item=None) -> None:
-    LOGGER.info("Запрошено завершение приложения")
-    if SERVER:
-        SERVER.should_exit = True
-    if icon:
-        icon.stop()
+    # No joins, graceful timeout, HTTP cleanup waits or logging locks: the OS
+    # closes every socket/thread when the process exits. Published DELETE/FULL
+    # snapshots survive; an unfinished search is intentionally interrupted.
+    module = sys.modules.get("ofd_app")
+    active = max(0, int(getattr(module, "ACTIVE_HTTP_REQUESTS", 0)))
+    message = f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFO Программа завершена принудительно; активных HTTP-запросов: {active}\n"
+    try:
+        descriptor = os.open(LOG_DIR / "app.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(descriptor, message.encode("utf-8"))
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
+    try:
+        tray = icon or TRAY
+        if tray:
+            tray.visible = False
+            # Icon.stop() joins its setup thread. Call the native loop stop only.
+            tray._stop()
+    except Exception:
+        pass
+    finally:
+        if SERVER_SOCKET:
+            try:
+                SERVER_SOCKET.close()
+            except OSError:
+                pass
+        _remove_runtime_file()
+        try:
+            _release_mutex()
+        finally:
+            os._exit(0)
 
 
 def acquire_single_instance() -> bool:
@@ -642,7 +633,8 @@ def main() -> None:
         pystray.MenuItem("Скопировать ссылку интерфейса", copy_interface_url),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Перезапустить", restart_app),
-        pystray.MenuItem("Настройки", _settings_menu()),
+        pystray.MenuItem(_history_caption, None, enabled=False),
+        pystray.MenuItem("Удалить все результаты запросов…", clear_history),
         pystray.MenuItem("Открыть журнал", open_log),
         pystray.MenuItem("Папка данных", open_data_folder),
         pystray.Menu.SEPARATOR,

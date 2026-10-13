@@ -3,6 +3,7 @@ import csv
 import gzip
 import zlib
 from contextlib import closing, contextmanager
+from collections import Counter
 import io
 import json
 import logging
@@ -101,6 +102,10 @@ def configure_result_connection(connection: sqlite3.Connection, profile: dict[st
 
 RESULT_READERS: dict[str, int] = {}
 RESULT_READERS_LOCK = threading.RLock()
+RESULT_WRITERS: dict[str, set[str]] = {}
+HISTORY_PENDING_DELETIONS: set[str] = set()
+HISTORY_SOFT_LIMIT_BYTES = 5 * 1024 ** 3
+HISTORY_CLEARING = False
 
 
 def raw_pack_path(name: str) -> Path:
@@ -115,6 +120,7 @@ class ResultConnection(sqlite3.Connection):
 
     def close(self) -> None:
         super().close()
+        retry_cleanup = False
         with RESULT_READERS_LOCK:
             if self.store_id is not None:
                 count = RESULT_READERS.get(self.store_id, 1) - 1
@@ -122,7 +128,10 @@ class ResultConnection(sqlite3.Connection):
                     RESULT_READERS[self.store_id] = count
                 else:
                     RESULT_READERS.pop(self.store_id, None)
+                    retry_cleanup = self.store_id in HISTORY_PENDING_DELETIONS
                 self.store_id = None
+        if retry_cleanup:
+            threading.Thread(target=cleanup_after_reader_close, name="history-release", daemon=True).start()
 
 
 class BoundedRawReader:
@@ -295,8 +304,15 @@ class DocumentStore:
         self.memory_budget = IntermediateMemory(self.profile["intermediate_memory_mb"])
         self.lock = threading.RLock()
         self.cancelled = cancelled if cancelled is not None else threading.Event()
-        self.connection = sqlite3.connect(self.path, check_same_thread=False)
-        self.raw_stream = raw_pack_path(self.raw_name).open("w+b")
+        with RESULT_READERS_LOCK:
+            self.connection = sqlite3.connect(self.path, check_same_thread=False)
+            try:
+                self.raw_stream = raw_pack_path(self.raw_name).open("w+b")
+            except BaseException:
+                self.connection.close()
+                self.path.unlink(missing_ok=True)
+                raise
+            RESULT_WRITERS[self.store_id] = {self.raw_name}
         self.count = self.pending = 0
         try:
             legacy = copy_from is not None and copy_from.is_legacy()
@@ -326,7 +342,9 @@ class DocumentStore:
         except BaseException:
             self.connection.close()
             self.raw_stream.close()
-            delete_result_files(self.store_id)
+            with RESULT_READERS_LOCK:
+                RESULT_WRITERS.pop(self.store_id, None)
+                delete_result_files(self.store_id)
             raise
 
     def _commit(self) -> None:
@@ -384,6 +402,8 @@ class DocumentStore:
             return
         new_name = uuid.uuid4().hex + ".raw"
         new_path = raw_pack_path(new_name)
+        with RESULT_READERS_LOCK:
+            RESULT_WRITERS[self.store_id].add(new_name)
         try:
             self.connection.execute("CREATE TEMP TABLE raw_repack_map (rid INTEGER PRIMARY KEY, raw_offset INTEGER NOT NULL)")
             with new_path.open("w+b") as target:
@@ -441,9 +461,11 @@ def delete_result_files(store_id: str) -> None:
 
 
 def remove_unpublished_store(store: DocumentStore) -> None:
-    delete_result_files(store.store_id)
-    # A finished compaction may have given this unpublished pack a fresh name.
-    raw_pack_path(store.raw_name).unlink(missing_ok=True)
+    with RESULT_READERS_LOCK:
+        RESULT_WRITERS.pop(store.store_id, None)
+        delete_result_files(store.store_id)
+        # A finished compaction may have given this unpublished pack a fresh name.
+        raw_pack_path(store.raw_name).unlink(missing_ok=True)
 
 
 SEARCH_STORE: ContextVar[DocumentStore | None] = ContextVar("ofd_document_store", default=None)
@@ -498,6 +520,10 @@ SEARCH_LOCK = asyncio.Lock()
 ACTIVE_SEARCH_TASK: asyncio.Task[Any] | None = None
 ACTIVE_REQUEST: dict[str, Any] | None = None
 SEARCH_STATE_FILE = APP_DATA_DIR / "last_search.json"
+HISTORY_STATE_FILE = APP_DATA_DIR / "result_history.json"
+HISTORY_PREVIOUS_STORE_ID: str | None = None
+HISTORY_INITIALIZED = False
+HISTORY_LAST_INFO: dict[str, Any] = {"used_gb": 0, "snapshots": 0}
 
 STATE: dict[str, Any] = {
     "running": False,
@@ -509,6 +535,7 @@ STATE: dict[str, Any] = {
     "message": "",
     "cancelled": False,
     "error": "",
+    "history_revision": int(time.time() * 1000),
 }
 
 # LAST_SEARCH содержит внутренний контекст для ручного повтора failed tasks.
@@ -565,7 +592,7 @@ def load_saved_search_state() -> None:
             # The old huge inline database is redundant after an atomic switch.
             if original_store_id:
                 delete_result_files(original_store_id)
-            cleanup_result_stores(None)
+            cleanup_result_stores(None, clear_history=True, publish_current=True)
             STATE.update(stage="Готово", message="Сохранённые документы перенесены в компактный индекс")
     except Exception:
         LOGGER.exception("Не удалось восстановить последний результат поиска")
@@ -605,40 +632,129 @@ def persist_search_state() -> bool:
         return False
 
 
-def cleanup_result_stores(previous_store_id: str | None) -> None:
-    # Hold the reader lock through mark-and-sweep so a new card/export cannot
-    # open a snapshot between deciding it is unused and deleting its packs.
+def snapshot_files(store_id: str) -> set[Path]:
+    path = result_db_path(store_id)
+    files = {path, *(path.with_name(path.name + suffix) for suffix in ("-journal", "-wal", "-shm"))}
+    # Do not lease an internal GC inspection, or closing it would recurse into GC.
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
+        if "compact" not in columns or not {"raw", "raw_file"}.intersection(columns):
+            raise ValueError("Неизвестный формат индекса; очистка отложена")
+        if "raw_file" in columns:
+            for (name,) in connection.execute("SELECT DISTINCT raw_file FROM documents"):
+                if not isinstance(name, str):
+                    raise ValueError("Некорректная ссылка на архив; очистка отложена")
+                files.add(raw_pack_path(name))
+    if any(not file.is_file() for file in files if file.suffix == ".raw"):
+        raise ValueError("Архив результата не найден; очистка отложена")
+    return files
+
+
+def history_storage_info() -> dict[str, Any]:
+    global HISTORY_LAST_INFO
     with RESULT_READERS_LOCK:
-        keep = {previous_store_id, (LAST_RESPONSE or {}).get("store_id"), *RESULT_READERS}
-        for path in RESULTS_DIR.glob("*.sqlite"):
-            if not re.fullmatch(r"[0-9a-f]{32}", path.stem):
-                continue
-            if path.stem not in keep:
+        files = [path for path in RESULTS_DIR.iterdir() if path.is_file() and
+                 re.fullmatch(r"[0-9a-f]{32}\.(?:sqlite(?:-(?:journal|wal|shm))?|raw)", path.name)]
+        size = 0
+        for path in files:
+            try:
+                size += path.stat().st_size
+            except FileNotFoundError:
+                pass
+        current = (LAST_RESPONSE or {}).get("store_id")
+        count = sum(path.suffix == ".sqlite" and (path.stem not in RESULT_WRITERS or path.stem == current) for path in files)
+        HISTORY_LAST_INFO = {"used_bytes": size, "used_gb": round(size / 1024 ** 3, 3), "snapshots": count,
+                "soft_limit_gb": 5, "pending_deletions": len(HISTORY_PENDING_DELETIONS),
+                "busy": bool(STATE["running"] or RESULT_WRITERS), "clearing": HISTORY_CLEARING,
+                "history_revision": STATE["history_revision"], "current_store_id": current}
+        return dict(HISTORY_LAST_INFO)
+
+
+def cleanup_after_reader_close() -> None:
+    try:
+        cleanup_result_stores()
+    except (OSError, ValueError):
+        LOGGER.exception("Отложенная очистка истории не выполнена")
+
+
+def cleanup_result_stores(previous_store_id: str | None = None, *, clear_history: bool = False,
+                          publish_current: bool = False) -> dict[str, Any]:
+    global HISTORY_PREVIOUS_STORE_ID, HISTORY_INITIALIZED
+    # Serialize GC with new leases and in-progress writers. A published current
+    # snapshot, shared packs and active exports must survive every cleanup.
+    with RESULT_READERS_LOCK:
+        current = (LAST_RESPONSE or {}).get("store_id")
+        # LAST_RESPONSE changes just before last_search.json is atomically
+        # written. An export finishing in that gap must not reclaim the last
+        # durable snapshot. Only the post-persist publisher may cross this gate.
+        if current in RESULT_WRITERS and not publish_current:
+            return history_storage_info()
+        if current is None and SEARCH_STATE_FILE.exists():
+            raise ValueError("Последний результат не восстановлен; очистка отложена для сохранности данных")
+        paths = {path.stem: path for path in RESULTS_DIR.glob("*.sqlite") if re.fullmatch(r"[0-9a-f]{32}", path.stem)}
+        if current is not None and current not in paths:
+            raise ValueError("Индекс текущего результата не найден; очистка отложена")
+        if publish_current:
+            RESULT_WRITERS.pop(current, None)
+            RESULT_WRITERS.pop(previous_store_id, None)
+        if not HISTORY_INITIALIZED:
+            try:
+                saved = json.loads(HISTORY_STATE_FILE.read_text(encoding="utf-8"))
+                HISTORY_PREVIOUS_STORE_ID = saved.get("previous_store_id") if saved.get("current_store_id") == current else saved.get("current_store_id")
+            except (OSError, ValueError, AttributeError):
+                candidates = [path for key, path in paths.items() if key != current and key not in RESULT_WRITERS]
+                HISTORY_PREVIOUS_STORE_ID = max(candidates, key=lambda path: path.stat().st_mtime).stem if candidates else None
+            HISTORY_INITIALIZED = True
+        previous = previous_store_id if previous_store_id is not None else HISTORY_PREVIOUS_STORE_ID
+        if clear_history or not isinstance(previous, str) or previous == current or previous not in paths:
+            previous = None
+        intended = {key for key in (current, previous) if key in paths}
+        protected = intended | set(RESULT_READERS)
+        try:
+            references = {key: snapshot_files(key) for key in protected if key in paths and key not in RESULT_WRITERS}
+            pair_files = set().union(*(references.get(key, set()) for key in intended))
+            pair_bytes = sum(path.stat().st_size for path in pair_files if path.exists())
+            if previous and pair_bytes > HISTORY_SOFT_LIMIT_BYTES:
+                intended.discard(previous)
+                previous = None
+            temporary = HISTORY_STATE_FILE.with_suffix(".tmp")
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump({"current_store_id": current, "previous_store_id": previous}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(HISTORY_STATE_FILE)
+        except (OSError, ValueError, sqlite3.Error):
+            LOGGER.exception("Очистка истории отложена: не удалось проверить или сохранить ссылки")
+            if clear_history:
+                raise ValueError("История не удалена: не удалось проверить сохранность текущего результата")
+            return history_storage_info()
+        HISTORY_PREVIOUS_STORE_ID = previous
+        HISTORY_PENDING_DELETIONS.clear()
+        keep = intended | set(RESULT_READERS) | set(RESULT_WRITERS)
+        for key, path in paths.items():
+            if key not in intended and key in RESULT_READERS:
+                HISTORY_PENDING_DELETIONS.add(key)
+            if key not in keep:
                 try:
                     path.unlink()
                     for suffix in ("-journal", "-wal", "-shm"):
                         path.with_name(path.name + suffix).unlink(missing_ok=True)
                 except OSError:
-                    keep.add(path.stem)
-        referenced = set()
+                    keep.add(key)
+                    HISTORY_PENDING_DELETIONS.add(key)
         try:
-            for store_id in keep:
-                if store_id and result_db_path(store_id).exists():
-                    with closing(DiskRows(store_id).connect()) as connection:
-                        columns = {r[1] for r in connection.execute("PRAGMA table_info(documents)")}
-                        if "raw_file" in columns:
-                            referenced.update(r[0] for r in connection.execute("SELECT DISTINCT raw_file FROM documents"))
-        except (OSError, sqlite3.Error):
+            referenced = set().union(*(snapshot_files(key) for key in keep if key in paths and key not in RESULT_WRITERS))
+            referenced.update(raw_pack_path(name) for names in RESULT_WRITERS.values() for name in names)
+        except (OSError, ValueError, sqlite3.Error):
             LOGGER.exception("Очистка архивов отложена: не удалось проверить ссылки")
-            return  # Never remove packs when their live references are uncertain.
+            return history_storage_info()
         for path in RESULTS_DIR.glob("*.raw"):
-            if not re.fullmatch(r"[0-9a-f]{32}\.raw", path.name):
-                continue
-            if path.name not in referenced:
+            if re.fullmatch(r"[0-9a-f]{32}\.raw", path.name) and path not in referenced:
                 try:
                     path.unlink()
                 except OSError:
                     pass
+        return history_storage_info()
 
 
 def close_search_store() -> None:
@@ -657,6 +773,42 @@ def close_search_store() -> None:
                 remove_unpublished_store(store)
             except OSError:
                 pass
+
+
+async def finish_storage_work(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Cancellation waits for disk work, so clearing cannot race a late write."""
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+            break
+        except asyncio.CancelledError:
+            if worker.done():
+                raise
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+def clear_all_search_results() -> dict[str, Any]:
+    global LAST_RESPONSE, LEGACY_STORE_TO_MIGRATE, HISTORY_PREVIOUS_STORE_ID, HISTORY_INITIALIZED
+    with RESULT_READERS_LOCK:
+        # Remove the durable restore pointer before deleting any documents.
+        SEARCH_STATE_FILE.unlink(missing_ok=True)
+        SEARCH_STATE_FILE.with_suffix(".tmp").unlink(missing_ok=True)
+        LAST_RESPONSE = None
+        LAST_SEARCH.update(rows=[], failed_tasks=[], meta={})
+        LEGACY_STORE_TO_MIGRATE = None
+        HISTORY_PREVIOUS_STORE_ID = None
+        HISTORY_INITIALIZED = True
+        # SEARCH_LOCK is held and the cancelled task has finished all disk work.
+        RESULT_WRITERS.clear()
+        STATE.update(running=False, stage="История очищена", done=0, total=0, found=0,
+                     errors=0, message="Все результаты запросов удалены", cancelled=False,
+                     error="", history_revision=STATE["history_revision"] + 1)
+        return cleanup_result_stores(clear_history=True)
 
 
 def effective_concurrency(requested: int) -> int:
@@ -717,7 +869,7 @@ async def migrate_saved_store_background() -> None:
             if persist_search_state():
                 published = True
                 LEGACY_STORE_TO_MIGRATE = None
-                await asyncio.to_thread(cleanup_result_stores, None)
+                await asyncio.to_thread(cleanup_result_stores, None, clear_history=True, publish_current=True)
                 STATE.update(stage="Готово", message="Сохранённые документы перенесены в компактный индекс")
             else:
                 LAST_RESPONSE, LAST_SEARCH["rows"] = old_response, old_rows
@@ -749,6 +901,11 @@ async def start_saved_store_migration() -> None:
     if LEGACY_STORE_TO_MIGRATE:
         STATE["running"] = True
         ACTIVE_SEARCH_TASK = asyncio.create_task(migrate_saved_store_background(), name="migrate-result-index")
+    else:
+        try:
+            await asyncio.to_thread(cleanup_result_stores)
+        except (OSError, ValueError):
+            LOGGER.exception("Очистка истории при запуске отложена")
 
 
 
@@ -911,25 +1068,158 @@ def query_local_page(request: LocalFilterRequest, cancelled: threading.Event | N
     return {"rows": rows, "filtered_count": total, "type_counts": counts, "page": page, "page_size": page_size}
 
 
-EXPORT_COLUMNS = [("Дата/время ФД", "date"), ("Тип", "type"), ("Внутреннее имя в ОФД", "kkm_internal_name"), ("Место установки", "retail_place"), ("РНМ", "kkm_reg_id"), ("ЗН ККТ", "kkm_factory_number"), ("ЗН ФН", "fs_number"), ("ФД", "fd"), ("ФПД", "fpd"), ("Смена", "shift"), ("Сумма", "amount"), ("Статус ФЛК ФНС", "fns_flc_status"), ("Код ФНС", "fns_status"), ("Описание ФНС", "fns_description"), ("Поступил в ОФД", "inserted_at"), ("Адрес", "address")]
+RECEIPT_FIELD_LABELS = {
+    "user": "Пользователь", "userName": "Пользователь", "userInn": "ИНН пользователя", "inn": "ИНН",
+    "operator": "Кассир", "operatorName": "Имя кассира", "operatorInn": "ИНН кассира", "cashier": "Кассир", "cashierInn": "ИНН кассира",
+    "taxationType": "Система налогообложения", "taxationSystem": "Система налогообложения", "appliedTaxationType": "Система налогообложения",
+    "operationType": "Признак расчёта", "calculationType": "Тип расчёта", "paymentType": "Признак способа расчёта",
+    "calculationTypeSign": "Признак способа расчёта", "calculationSubjectSign": "Признак предмета расчёта", "productType": "Признак предмета расчёта",
+    "totalSum": "Итого", "resultSum": "Итоговая сумма", "cashSum": "Оплата наличными", "cashTotalSum": "Оплата наличными",
+    "electronicSum": "Оплата безналичными", "ecashTotalSum": "Оплата безналичными", "ecashSum": "Сумма безналичной оплаты",
+    "prepaidSum": "Предоплата", "prepaymentSum": "Предоплата", "postpaymentSum": "Постоплата", "creditSum": "Оплата в кредит",
+    "provisionSum": "Встречное предоставление", "counterSubmissionSum": "Встречное предоставление",
+    "agentSum": "Сумма агента", "paymentAgentSum": "Сумма платёжного агента", "agentFee": "Вознаграждение агента",
+    "agentCommission": "Комиссия агента", "commissionSum": "Сумма комиссии", "commission": "Комиссия", "commissionAmount": "Сумма комиссии", "feeSum": "Сумма сбора",
+    "receiptCode": "Код чека", "requestNumber": "Номер чека за смену", "kktNumber": "Номер ККТ", "kktModel": "Модель ККТ", "fiscalDriveModel": "Модель ФН",
+    "ffdVersion": "Версия ФФД", "fiscalFormatVersion": "Версия ФФД", "fiscalDocumentVersion": "Версия ФФД",
+    "address": "Адрес", "paymentAddress": "Адрес расчётов", "retailAddress": "Адрес места установки", "retailPlaceAddress": "Адрес места расчётов",
+    "retailPlace": "Место расчётов", "paymentPlace": "Место расчётов", "ofdInn": "ИНН ОФД", "ofdName": "ОФД", "fnsUrl": "Сайт ФНС",
+    "name": "Наименование", "quantity": "Количество", "price": "Цена", "sum": "Сумма", "items": "Позиции", "itemsCount": "Количество позиций",
+    "taxes": "Налоги", "nds": "Ставка НДС", "ndsType": "Ставка НДС", "ndsRate": "Ставка НДС", "ndsSum": "Сумма НДС",
+    "nds0": "Сумма расчётов с НДС 0%", "ndsNo": "Сумма расчётов без НДС",
+    "correctionType": "Тип коррекции", "correctionReason": "Основание коррекции", "correctionDescription": "Описание коррекции",
+    "correctionDate": "Дата основания коррекции", "correctionNumber": "Номер основания коррекции", "reason": "Основание", "date": "Дата", "number": "Номер",
+    "registrationNumber": "Регистрационный номер", "kkmRegId": "РНМ", "kkmFactoryNumber": "ЗН ККТ", "fiscalDriveNumber": "ЗН ФН", "fsFactoryNumber": "ЗН ФН",
+    "fiscalDocumentNumber": "ФД", "fiscalSign": "ФПД", "transactionDate": "Дата и время ФД", "shiftNum": "Смена", "shiftNumber": "Смена",
+    "insertedAt": "Поступление в ОФД", "fnsFlcStatus": "Статус ФЛК ФНС", "fnsStatus": "Код ФНС", "fnsDescription": "Описание ФНС", "fnsConfirmation": "Подтверждение ФНС",
+    "fiscalReport": "Данные регистрации", "fiscalReportCorrection": "Данные перерегистрации", "closeArchive": "Данные закрытия ФН",
+    "ticket": "Данные чека", "receiptCorrection": "Данные коррекции", "bso": "Данные БСО", "bsoCorrection": "Данные коррекции БСО", "openShift": "Данные открытия смены", "closeShift": "Данные закрытия смены",
+    "productCodeNew": "Коды товара и маркировки", "productCode": "Код товара", "gs1m": "Код маркировки", "gs1": "Код товара (GS1)",
+    "ean8": "Код товара (EAN-8)", "ean13": "Код товара (EAN-13)", "itf14": "Код товара (ITF-14)", "undefined": "Код товара неустановленного формата",
+    "kmk": "Короткий код маркировки", "mi": "Идентификационный знак мехового изделия", "egais2": "Код товара (ЕГАИС 2.0)", "egais3": "Код товара (ЕГАИС 3.0)",
+    "rawProductCode": "Исходный код товара", "productIdType": "Тип кода товара", "gtin": "Международный номер товара", "sernum": "Серийный номер товара",
+    "labelCodeProcessMode": "Режим обработки маркировки", "labelCodeProcesMode": "Режим обработки маркировки", "checkingProdInformationResult": "Результат проверки товара",
+    "checkingLabeledProdResult": "Результат проверки маркировки", "controlCode": "Контрольный код маркировки", "labeledProdFractionalQuantity": "Дробное количество маркированного товара",
+    "fractionalPart": "Дробная часть количества", "numerator": "Числитель", "denominator": "Знаменатель", "itemsQuantityMeasure": "Единица измерения количества",
+    "paymentAgentByProductType": "Признак агента по предмету расчёта", "paymentAgentType": "Признак платёжного агента", "paymentAgentData": "Данные платёжного агента",
+    "providerInn": "ИНН поставщика", "providerData": "Данные поставщика", "providerPhone": "Телефон поставщика", "providerName": "Название поставщика",
+    "transferOperatorName": "Название оператора перевода", "transferOperatorAddress": "Адрес оператора перевода", "transferOperatorInn": "ИНН оператора перевода",
+    "paymentAgentOperation": "Операция платёжного агента", "paymentAgentPhone": "Телефон платёжного агента", "paymentOperatorPhone": "Телефон оператора приёма платежей", "transferOperatorPhone": "Телефон оператора перевода",
+    "industryReceiptRequisite": "Отраслевой реквизит", "itemsIndustryDetails": "Отраслевые реквизиты позиции", "foivId": "Код федерального органа", "idFoiv": "Код федерального органа",
+    "documentDate": "Дата документа-основания", "documentNumber": "Номер документа-основания", "foundationDocDateTime": "Дата документа-основания", "foundationDocNumber": "Номер документа-основания", "industryPropValue": "Значение отраслевого реквизита",
+    "userProperty": "Дополнительный реквизит пользователя", "properties": "Дополнительные реквизиты", "property": "Дополнительный реквизит", "key": "Название реквизита", "value": "Значение реквизита", "propertyName": "Название реквизита", "propertyValue": "Значение реквизита",
+    "buyerPhoneOrAddress": "Телефон или почта покупателя", "buyerInformation": "Сведения о покупателе", "buyer": "Покупатель", "buyerInn": "ИНН покупателя", "internetPayment": "Признак расчёта в интернете",
+    "allECashProp": "Сведения о безналичной оплате", "ecashProp": "Безналичная оплата", "ecashSign": "Признак способа безналичной оплаты", "ecashIdent": "Идентификатор безналичной оплаты", "ecashAddInfo": "Дополнительные сведения об оплате",
+    "amountsReceiptNds": "Суммы НДС чека", "amountsNds": "НДС", "machineNumber": "Номер автомата", "online": "Признак работы онлайн", "irkktStatus": "Статус ККТ", "transactionType": "Тип документа",
+    "id": "Внутренний идентификатор", "retailPlaceId": "Идентификатор места установки", "_retailPlaceId": "Идентификатор места установки", "kkmInternalName": "Внутреннее имя в ОФД",
+}
+for _rate in (5, 7, 10, 18, 20, 22):
+    RECEIPT_FIELD_LABELS[f"nds{_rate}"] = f"Сумма НДС {_rate}%"
+    RECEIPT_FIELD_LABELS[f"ndsCalculated{_rate}"] = f"Сумма НДС по расчётной ставке {_rate}/{100 + _rate}"
+for _format in range(1, 7):
+    RECEIPT_FIELD_LABELS[f"f{_format}"] = f"Код товара (формат Ф.{_format})"
+
+RECEIPT_PAYLOAD_KEYS = {"fiscalReport", "fiscalReportCorrection", "closeArchive", "ticket", "receiptCorrection", "bso", "bsoCorrection", "openShift", "closeShift"}
+ZERO_HIDDEN_RECEIPT_FIELDS = {
+    "cashSum", "cashTotalSum", "electronicSum", "ecashTotalSum", "ecashSum", "prepaidSum", "prepaymentSum", "postpaymentSum", "creditSum", "provisionSum", "counterSubmissionSum",
+    "agentSum", "paymentAgentSum", "agentFee", "agentCommission", "commissionSum", "commission", "commissionAmount", "feeSum", "ndsNo",
+    *(f"nds{rate}" for rate in (5, 7, 10, 18, 20, 22)), *(f"ndsCalculated{rate}" for rate in (5, 7, 10, 18, 20, 22)),
+}
+
+
+def receipt_field_label(path: tuple[str, ...]) -> str:
+    parts = []
+    skip_index = False
+    for index, key in enumerate(path):
+        if skip_index:
+            skip_index = False
+            continue
+        if key in RECEIPT_PAYLOAD_KEYS:
+            continue
+        if key == "items" and index + 1 < len(path) and path[index + 1].isdigit():
+            parts.append("Позиция " + path[index + 1])
+            skip_index = True
+        else:
+            parts.append(key if key.isdigit() else RECEIPT_FIELD_LABELS.get(key, "Дополнительный реквизит"))
+    if "items" in path and "productCodeNew" in path:
+        index = path.index("items") + 1
+        if index < len(path) and path[index].isdigit():
+            label = RECEIPT_FIELD_LABELS.get(path[-1], "Дополнительный реквизит")
+            if "gs1m" in path:
+                mark = path.index("gs1m")
+                return f"Код маркировки позиции {path[index]}" + (f" / {label}" if mark < len(path) - 1 else "")
+            return f"{label} позиции {path[index]}"
+    if path[-1] in {"nds0", "ndsNo"} or re.fullmatch(r"nds(?:Calculated)?\d+", path[-1]):
+        return RECEIPT_FIELD_LABELS.get(path[-1], "Дополнительный налоговый реквизит")
+    return " / ".join(parts)
+
+
+def receipt_fields(document: dict[str, Any], path: tuple[str, ...] = ()):
+    """Flatten one receipt for CSV; zero/false and unknown keys remain present."""
+    for key, value in document.items():
+        current = path + (key,)
+        if isinstance(value, dict):
+            if value:
+                yield from receipt_fields(value, current)
+            else:
+                yield current, receipt_field_label(current), "{}"
+        elif isinstance(value, list):
+            if not value:
+                yield current, receipt_field_label(current), "[]"
+            for index, item in enumerate(value, 1):
+                if isinstance(item, dict):
+                    if item:
+                        yield from receipt_fields(item, current + (str(index),))
+                    else:
+                        yield current + (str(index),), receipt_field_label(current + (str(index),)), "{}"
+                else:
+                    yield current + (str(index),), receipt_field_label(current + (str(index),)), json.dumps(item, ensure_ascii=False) if isinstance(item, list) else item
+        else:
+            yield current, receipt_field_label(current), value
+
+
+def export_raw_document(record: tuple, legacy: bool) -> dict[str, Any]:
+    if legacy:
+        raw = json.loads(record[1])
+    else:
+        with open_raw_record(*record[1:]) as stream:
+            raw = json.load(stream)
+    return raw.get("document") or {}
+
+
+EXPORT_COLUMNS = [("Дата и время ФД", "date"), ("Тип документа", "type"), ("Внутреннее имя в ОФД", "kkm_internal_name"), ("Место установки", "retail_place"), ("РНМ", "kkm_reg_id"), ("ЗН ККТ", "kkm_factory_number"), ("ЗН ФН", "fs_number"), ("ФД", "fd"), ("ФПД", "fpd"), ("Смена", "shift"), ("Сумма чека", "amount"), ("Статус ФЛК ФНС", "fns_flc_status"), ("Код ФНС", "fns_status"), ("Описание ФНС", "fns_description"), ("Поступление в ОФД", "inserted_at"), ("Адрес", "address")]
 
 
 def stream_export(request: LocalFilterRequest, format_name: str):
     with closing(local_connection(request)) as connection:
         order = "ASC" if request.sort_dir == "asc" else "DESC"
         legacy = "raw" in {r[1] for r in connection.execute("PRAGMA table_info(documents)")}
-        columns = ("compact,raw" if legacy else "compact,raw_file,raw_offset,raw_size") if format_name == "json" else "compact"
+        columns = "compact,raw" if legacy else "compact,raw_file,raw_offset,raw_size"
         sort_expression = "date_sort" if request.sort_key == "date_sort" else "sort_value(compact) COLLATE NATURAL_RU"
         records = connection.execute(f"SELECT {columns} FROM documents WHERE matches(compact) ORDER BY {sort_expression} {order},rid")
         if format_name == "csv":
+            # Discover columns in a streaming first pass, never collect receipts.
+            # CSV retains zeros: suppression is presentation-only in the card.
+            fields: dict[tuple[str, ...], str] = {}
+            for record in records:
+                for path, label, value in receipt_fields(export_raw_document(record, legacy)):
+                    if path not in fields:
+                        fields[path] = label
+            labels = list(fields.values())
+            duplicates = {label for label, count in Counter(labels).items() if count > 1}
+            labels = [label + (f" (реквизит {i + 1})" if label in duplicates else "") for i, label in enumerate(labels)]
+            api_names = json.dumps({label: ".".join(path) for label, path in zip(labels, fields)
+                                    if any(not key.isdigit() and key not in RECEIPT_FIELD_LABELS for key in path)}, ensure_ascii=False)
             buffer = io.StringIO(newline="")
             writer = csv.writer(buffer, delimiter=";", quoting=csv.QUOTE_ALL, lineterminator="\r\n")
-            writer.writerow([label for label, key in EXPORT_COLUMNS])
+            writer.writerow([label for label, key in EXPORT_COLUMNS] + labels + ["Служебные имена полей API"])
             yield "\ufeff" + buffer.getvalue()
-            for (compact,) in records:
-                row = json.loads(compact)
+            records = connection.execute(f"SELECT {columns} FROM documents WHERE matches(compact) ORDER BY {sort_expression} {order},rid")
+            for record in records:
+                row = json.loads(record[0])
+                values = {path: value for path, label, value in receipt_fields(export_raw_document(record, legacy))}
                 buffer.seek(0); buffer.truncate(0)
-                writer.writerow([row.get(key) if row.get(key) is not None else "" for label, key in EXPORT_COLUMNS])
+                writer.writerow([row.get(key) if row.get(key) is not None else "" for label, key in EXPORT_COLUMNS] + [values.get(path, "") for path in fields] + [api_names if api_names != "{}" else ""])
                 yield buffer.getvalue()
         else:
             yield "["
@@ -969,13 +1259,50 @@ def safe_error_text(error: Exception) -> str:
     return text[:800]
 
 
+ACTIVE_HTTP_REQUESTS = 0
+
+
+class ActiveResponseStream(httpx.AsyncByteStream):
+    def __init__(self, stream: httpx.AsyncByteStream):
+        self.stream, self.closed = stream, False
+
+    async def __aiter__(self):
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        global ACTIVE_HTTP_REQUESTS
+        if not self.closed:
+            self.closed = True
+            try:
+                await self.stream.aclose()
+            finally:
+                ACTIVE_HTTP_REQUESTS -= 1
+
+
+class TrackedAsyncClient(httpx.AsyncClient):
+    async def send(self, *args: Any, **kwargs: Any) -> httpx.Response:
+        global ACTIVE_HTTP_REQUESTS
+        ACTIVE_HTTP_REQUESTS += 1
+        try:
+            response = await super().send(*args, **kwargs)
+        except BaseException:
+            ACTIVE_HTTP_REQUESTS -= 1
+            raise
+        if kwargs.get("stream", False) and not response.is_closed:
+            response.stream = ActiveResponseStream(response.stream)
+        else:
+            ACTIVE_HTTP_REQUESTS -= 1
+        return response
+
+
 def create_http_client(*, limits: httpx.Limits, timeout: httpx.Timeout, http2: bool = False) -> httpx.AsyncClient:
     """Create one HTTP client with an explicit bundled CA store.
 
     PyInstaller onefile does not always discover certifi's CA bundle reliably on its own.
     Keeping this explicit makes HTTPS behave the same in source and in the frozen EXE.
     """
-    return httpx.AsyncClient(
+    return TrackedAsyncClient(
         limits=limits,
         timeout=timeout,
         http2=http2,
@@ -2184,6 +2511,8 @@ def build_payload(
 
 async def perform_search(request: SearchRequest) -> dict[str, Any]:
     profile = get_load_profile()
+    # The single saved load setting replaces the old filter-panel override.
+    request.concurrency = profile["concurrency_cap"]
     SEARCH_PROFILE.set(profile)
     SEARCH_CONCURRENCY_CAP.set(profile["concurrency_cap"])
     started = time.perf_counter()
@@ -2326,7 +2655,7 @@ async def perform_search(request: SearchRequest) -> dict[str, Any]:
                 primary_concurrency=request.concurrency,
             )
 
-    await asyncio.to_thread(store.close)
+    await finish_storage_work(store.close)
     rows = deduplicate(rows)
     rows.sort(key=lambda item: str(item.get("date_sort") or ""), reverse=True)
 
@@ -2433,7 +2762,18 @@ async def retry_last_failed() -> dict[str, Any]:
     )
     timeout = httpx.Timeout(connect=20, read=90, write=30, pool=45)
 
-    store = await asyncio.to_thread(DocumentStore, copy_from=LAST_SEARCH["rows"])
+    copied: list[DocumentStore] = []
+    def copy_store() -> DocumentStore:
+        copied.append(DocumentStore(copy_from=LAST_SEARCH["rows"]))
+        return copied[0]
+    try:
+        store = await finish_storage_work(copy_store)
+    except asyncio.CancelledError:
+        if copied:
+            copied[0].cancelled.set()
+            await finish_storage_work(copied[0].close)
+            remove_unpublished_store(copied[0])
+        raise
     SEARCH_STORE.set(store)
     async with create_http_client(limits=limits, timeout=timeout) as client:
         token = await get_token(client)
@@ -2447,7 +2787,7 @@ async def retry_last_failed() -> dict[str, Any]:
             stage=f"Ручной повтор ({len(failed_tasks)} запросов)",
         )
 
-    await asyncio.to_thread(store.close)
+    await finish_storage_work(store.close)
     combined_rows = rows
     combined_rows.sort(key=lambda item: str(item.get("date_sort") or ""), reverse=True)
 
@@ -2567,7 +2907,7 @@ async def refresh_update_cache() -> None:
     updated = dict(UPDATE_CACHE)
     updated["attempt_at"] = time.time()
     try:
-        async with httpx.AsyncClient(timeout=6, verify=certifi.where()) as client:
+        async with TrackedAsyncClient(timeout=6, verify=certifi.where()) as client:
             async with client.stream("GET", "https://api.github.com/repos/4geg/1ofd-fiscal-docs/releases/latest", headers={"Accept": "application/vnd.github+json", "User-Agent": "1OFD-Fiscal-Docs/" + VERSION}) as response:
                 response.raise_for_status()
                 body = bytearray()
@@ -2756,13 +3096,15 @@ async def status() -> dict[str, Any]:
 class LoadSettingsRequest(BaseModel):
     profile: str | None = None
     values: dict[str, Any] | None = None
+    log_limit_mb: int | None = Field(default=None, strict=True)
     model_config = {"extra": "forbid"}
 
 
 def load_settings_payload() -> dict[str, Any]:
     return {"profile": get_load_profile(), "profiles": LOAD_PROFILES,
             "labels": MANUAL_SETTING_LABELS, "ranges": MANUAL_SETTING_RANGES,
-            "storage_modes": STORAGE_MODE_NAMES}
+            "storage_modes": STORAGE_MODE_NAMES, "log_limit_mb": get_runtime_settings()["log_limit_mb"],
+            "log_limits_mb": [1, 5, 10, 25, 50]}
 
 
 @app.get("/api/load-settings")
@@ -2773,15 +3115,62 @@ def load_settings() -> dict[str, Any]:
 @app.post("/api/load-settings")
 def save_load_settings(request: LoadSettingsRequest) -> dict[str, Any]:
     try:
-        if request.profile is not None and request.values is None:
+        if request.log_limit_mb is not None and request.profile is None and request.values is None:
+            set_runtime_setting("log_limit_mb", request.log_limit_mb)
+        elif request.profile is not None and request.values is None and request.log_limit_mb is None:
             set_runtime_setting("load_profile", request.profile)
-        elif request.profile is None and request.values is not None:
+        elif request.profile is None and request.values is not None and request.log_limit_mb is None:
             set_manual_settings(request.values)
         else:
             raise ValueError("Выбери пресет или сохрани ручные значения")
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return load_settings_payload()
+
+
+class HistoryClearRequest(BaseModel):
+    confirmed: bool = Field(default=False, strict=True)
+    model_config = {"extra": "forbid"}
+
+
+@app.get("/api/history")
+def history_info() -> dict[str, Any]:
+    return history_storage_info()
+
+
+@app.post("/api/history/clear")
+async def history_clear(request: HistoryClearRequest) -> dict[str, Any]:
+    global HISTORY_CLEARING, ACTIVE_SEARCH_TASK, ACTIVE_REQUEST
+    if not request.confirmed:
+        raise HTTPException(status_code=400, detail="Подтверди удаление истории запросов")
+    if HISTORY_CLEARING:
+        raise HTTPException(status_code=409, detail="История уже очищается")
+    HISTORY_CLEARING = True
+    try:
+        task = ACTIVE_SEARCH_TASK
+        if task is not None and not task.done():
+            set_state(stage="Очистка истории", message="Останавливаю активный запрос и удаляю результаты…")
+            task.cancel("history_clear")
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    raise
+        async with SEARCH_LOCK:
+            ACTIVE_SEARCH_TASK = None
+            ACTIVE_REQUEST = None
+            try:
+                info = await finish_storage_work(clear_all_search_results)
+            except (OSError, ValueError, sqlite3.Error) as error:
+                raise HTTPException(status_code=409, detail=f"Не удалось полностью очистить историю: {error}") from error
+    finally:
+        HISTORY_CLEARING = False
+    info["clearing"] = False
+    HISTORY_LAST_INFO["clearing"] = False
+    info["message"] = ("Все результаты запросов удалены, включая текущий." if not info["pending_deletions"] else
+                       "Все результаты удалены из истории. Файлы открытых карточек или экспорта удалятся после их закрытия.")
+    LOGGER.info("История запросов очищена полностью, включая текущий результат")
+    return info
 
 
 @app.get("/api/session")
@@ -2814,8 +3203,8 @@ async def _run_search_background(request: SearchRequest) -> None:
                 previous_store_id = (LAST_RESPONSE or {}).get("store_id")
                 payload = await perform_search(request)
                 LAST_RESPONSE = payload
-                if await asyncio.to_thread(persist_search_state):
-                    await asyncio.to_thread(cleanup_result_stores, previous_store_id)
+                if await finish_storage_work(persist_search_state):
+                    await finish_storage_work(cleanup_result_stores, previous_store_id, publish_current=True)
             except asyncio.CancelledError:
                 set_state(
                     stage="Остановлено",
@@ -2836,7 +3225,7 @@ async def _run_search_background(request: SearchRequest) -> None:
                 LOGGER.exception("Ошибка фонового поиска документов")
             finally:
                 try:
-                    await asyncio.to_thread(close_search_store)
+                    await finish_storage_work(close_search_store)
                 finally:
                     STATE["running"] = False
     finally:
@@ -2847,6 +3236,8 @@ async def _run_search_background(request: SearchRequest) -> None:
 @app.post("/api/search")
 async def search(request: SearchRequest) -> dict[str, Any]:
     global ACTIVE_SEARCH_TASK, ACTIVE_REQUEST
+    if HISTORY_CLEARING:
+        raise HTTPException(status_code=409, detail="Дождись завершения очистки истории")
     if ACTIVE_SEARCH_TASK is not None and not ACTIVE_SEARCH_TASK.done():
         raise HTTPException(status_code=409, detail="Поиск уже выполняется")
     if SEARCH_LOCK.locked():
@@ -2900,8 +3291,8 @@ async def _run_retry_background() -> None:
                 previous_store_id = (LAST_RESPONSE or {}).get("store_id")
                 payload = await retry_last_failed()
                 LAST_RESPONSE = payload
-                if await asyncio.to_thread(persist_search_state):
-                    await asyncio.to_thread(cleanup_result_stores, previous_store_id)
+                if await finish_storage_work(persist_search_state):
+                    await finish_storage_work(cleanup_result_stores, previous_store_id, publish_current=True)
             except asyncio.CancelledError:
                 set_state(
                     stage="Остановлено",
@@ -2917,7 +3308,7 @@ async def _run_retry_background() -> None:
                 LOGGER.exception("Ошибка фонового повтора запросов")
             finally:
                 try:
-                    await asyncio.to_thread(close_search_store)
+                    await finish_storage_work(close_search_store)
                 finally:
                     STATE["running"] = False
     finally:
@@ -2928,6 +3319,8 @@ async def _run_retry_background() -> None:
 @app.post("/api/retry-failed")
 async def retry_failed() -> dict[str, Any]:
     global ACTIVE_SEARCH_TASK, ACTIVE_REQUEST
+    if HISTORY_CLEARING:
+        raise HTTPException(status_code=409, detail="Дождись завершения очистки истории")
     if ACTIVE_SEARCH_TASK is not None and not ACTIVE_SEARCH_TASK.done():
         raise HTTPException(status_code=409, detail="Другой запрос уже выполняется")
     if SEARCH_LOCK.locked():
@@ -2962,12 +3355,17 @@ HTML = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Первый ОФД — фискальные документы · 1.7.6</title>
+<title>Первый ОФД — фискальные документы · 1.7.8</title>
 <link rel="icon" href="/favicon.ico">
 <style>
 #loadManualFields{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:16px;margin-top:18px}
 #loadSettingsModal .field label{display:block;margin-bottom:8px}
 #loadSettingsModal input{width:100%;box-sizing:border-box}
+.load-preset-controls{display:grid;gap:18px;margin-bottom:14px}
+.load-preset-controls>.btn{justify-self:start}
+.settings-button{display:inline-flex;align-items:center;gap:8px}
+.settings-section{padding:10px 0 22px}.settings-section+.settings-section{padding-top:22px;border-top:1px solid var(--surface-2)}
+.settings-section h3{margin:0 0 14px;color:var(--blue-deep)}.settings-section h4{margin:20px 0 0}
 
 
 @font-face{font-family:'Noto Sans OFD';src:url('/static/fonts/NotoSans-Variable.ttf') format('truetype');font-weight:100 900;font-style:normal;font-display:swap}
@@ -3571,7 +3969,7 @@ body{font-weight:400;font-synthesis:none}
 </style>
 </head>
 <body>
-<div class="topbar"><div class="brand">Первый ОФД <span>• Фискальные документы</span></div><div class="topnote">локальное веб-приложение • Universal API</div><div class="topbar-actions"><a id="versionBtn" class="version-chip version-button ui-tooltip" href="https://github.com/4geg/1ofd-fiscal-docs" target="_blank" rel="noopener" data-tip="Открыть GitHub">v1.7.7<span id="versionAlert" class="version-alert" style="display:none">!</span></a><div class="reset-group"><span class="reset-caption">Сброс</span><div class="reset-control" role="group" aria-label="Сброс фильтров и результата"><button id="resetAllFiltersBtn" class="ui-tooltip" type="button" data-tip="Сбросить фильтры" aria-label="Сбросить фильтры"><span class="reset-arrow" aria-hidden="true">↻</span>Фильтры</button><button id="resetEverythingBtn" class="ui-tooltip" type="button" data-tip="Сбросить фильтры и результат" aria-label="Сбросить фильтры и результат"><span class="reset-arrow" aria-hidden="true">↻</span>Всё</button><button id="resetLoadedResultBtn" class="ui-tooltip" type="button" data-tip="Сбросить результат" aria-label="Сбросить результат"><span class="reset-arrow" aria-hidden="true">↻</span>Результат</button></div></div><button id="apiKeyBtn" class="api-key-btn">API-ключ</button></div></div>
+<div class="topbar"><div class="brand">Первый ОФД <span>• Фискальные документы</span></div><div class="topnote">локальное веб-приложение • Universal API</div><div class="topbar-actions"><a id="versionBtn" class="version-chip version-button ui-tooltip" href="https://github.com/4geg/1ofd-fiscal-docs" target="_blank" rel="noopener" data-tip="Открыть GitHub">v1.7.8<span id="versionAlert" class="version-alert" style="display:none">!</span></a><div class="reset-group"><span class="reset-caption">Сброс</span><div class="reset-control" role="group" aria-label="Сброс фильтров и результата"><button id="resetAllFiltersBtn" class="ui-tooltip" type="button" data-tip="Сбросить фильтры" aria-label="Сбросить фильтры"><span class="reset-arrow" aria-hidden="true">↻</span>Фильтры</button><button id="resetEverythingBtn" class="ui-tooltip" type="button" data-tip="Сбросить фильтры и результат" aria-label="Сбросить фильтры и результат"><span class="reset-arrow" aria-hidden="true">↻</span>Всё</button><button id="resetLoadedResultBtn" class="ui-tooltip" type="button" data-tip="Сбросить результат" aria-label="Сбросить результат"><span class="reset-arrow" aria-hidden="true">↻</span>Результат</button></div></div><button id="settingsBtn" class="api-key-btn settings-button" type="button" aria-label="Открыть настройки"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m9 3 1-1h4l1 1 .5 2 2 1 2-.5 2 3-.5 2-1.5 1v2l1.5 1 .5 2-2 3-2-.5-2 1-.5 2-1 1h-4l-1-1-.5-2-2-1-2 .5-2-3 .5-2L4 14v-2l-1.5-1L2 9l2-3 2 .5 2-1L9 3Z"/><circle cx="12" cy="12" r="3"/></svg>НАСТРОЙКИ</button><button id="apiKeyBtn" class="api-key-btn">API-ключ</button></div></div>
 <div class="page">
 
   <section class="panel" id="apiPanel">
@@ -3594,7 +3992,6 @@ body{font-weight:400;font-synthesis:none}
         <div class="field"><label>Место установки (точный поиск по наименованию места установки из данных регистрации ККТ)</label><input id="qRetail" class="input" placeholder="название или часть"></div>
         <div class="field"><label>Адрес установки (точный поиск по адресу места установки ККТ)</label><input id="qAddress" class="input" placeholder="адрес или часть"></div>
         <div class="field"><label>Номер смены</label><input id="qShift" class="input" inputmode="numeric" placeholder="например 415"></div>
-        <div class="field"><label>Количество параллельных обращений к API</label><div class="control-with-help"><select id="qConcurrency" class="select"><option>60</option><option>80</option><option>100</option><option selected>120</option><option>150</option><option>180</option><option>200</option></select><button class="inline-help" type="button" data-tip="Большие значения ускоряют поиск, но заметно повышают нагрузку на API. Обычно лучше использовать средние значения: они дают хорошую скорость и снижают риск ошибок соединения. Дополнительный предел задаётся в трее: Настройки → Профиль нагрузки / Ручные настройки. Применяется меньшее из двух значений.">!</button></div></div>
       </div>
       <div class="advanced-block">
         <div class="advanced-title">Типы фискальных документов</div>
@@ -3696,18 +4093,30 @@ body{font-weight:400;font-synthesis:none}
 <div id="failuresModal" class="modal"><div class="modal-box"><div class="modal-title">Непроверенные элементы <button class="close-x" title="Закрыть" aria-label="Закрыть" data-close="failuresModal">×</button></div><div class="modal-body"><div id="failureSummary" style="margin-bottom:10px"></div><div id="failureList" class="failure-list"></div></div></div></div>
 
 <div class="modal" id="loadSettingsModal">
-<div class="modal-box" style="width:min(760px,97vw)">
-<div class="modal-title"><b>Профиль нагрузки и ручные настройки</b><button class="close-x" data-close="loadSettingsModal" aria-label="Закрыть">×</button></div>
+<div class="modal-box" style="width:min(860px,97vw)">
+<div class="modal-title"><b>НАСТРОЙКИ</b><button class="close-x" data-close="loadSettingsModal" aria-label="Закрыть">×</button></div>
 <div class="modal-body">
+<section class="settings-section" id="settingsLoad"><h3>Нагрузка</h3>
 <p id="loadProfileName" class="csv-note"></p>
-<div class="field"><label for="loadPreset">Профиль</label><select class="select" id="loadPreset"></select></div>
-<button type="button" id="loadPresetApply" class="btn mini">Применить пресет</button>
-<p class="csv-note">«Максимальный» может заметно увеличить расход памяти. Пресет заменяет ручные значения.</p>
+<div class="load-preset-controls"><div class="field"><label for="loadPreset">Профиль</label><select class="select" id="loadPreset"></select></div>
+<button type="button" id="loadPresetApply" class="btn mini" disabled>Применить профиль</button>
+</div>
+<p class="csv-note">«Максимальный» может заметно увеличить расход памяти. Выбор профиля заменяет ручные значения.</p>
+<h4>Ручные параметры</h4>
 <form id="loadSettingsForm"><div id="loadManualFields" class="advanced-grid"></div>
-<p class="csv-note">Режим хранения относится к промежуточным ответам ОФД. Сохранённые документы всегда на диске. Когда лимит промежуточной памяти исчерпан, ответы продолжают записываться на диск. Лимит не ограничивает общую память программы.</p>
-<p class="csv-note">Одновременных запросов — верхний предел. Значение в фильтре API может дополнительно уменьшить его. Активный поиск сохраняет прежние настройки; новые значения действуют со следующего поиска или добора.</p>
+<p class="csv-note">Режим хранения относится к промежуточным ответам ОФД. Сохранённые документы всегда на диске. Если лимит промежуточной памяти исчерпан, ответы продолжают записываться на диск. Лимит не ограничивает общую память программы.</p>
+<p class="csv-note">Одновременных запросов — общий предел нагрузки. Активный поиск сохраняет прежние настройки; новые значения действуют со следующего поиска или добора.</p>
 <p id="loadSettingsMessage" role="status" class="csv-note"></p>
-<button class="btn" type="submit">Сохранить ручные настройки</button></form>
+<button class="btn" type="submit" disabled>Сохранить ручные настройки</button></form></section>
+<section class="settings-section" id="settingsHistory"><h3>Хранение истории</h3>
+<p id="historyStorageInfo" role="status">Загрузка…</p>
+<p class="csv-note">Автоматически хранятся текущий и предыдущий результаты запросов. Если вместе они занимают больше 5 ГБ, предыдущий удаляется. Текущий результат сохраняется полностью даже при объёме больше 5 ГБ. Кнопка ниже удаляет все результаты, включая текущий, и останавливает активный запрос.</p>
+<button class="btn" id="clearHistoryBtn" type="button" disabled>Удалить все результаты запросов</button>
+<p id="historySettingsMessage" role="status" class="csv-note"></p></section>
+<section class="settings-section" id="settingsLogging"><h3>Логирование</h3>
+<form id="logSettingsForm"><div class="field"><label for="logLimitMb">Лимит размера журнала на файл</label><select id="logLimitMb" class="select"></select></div>
+<p class="csv-note">Сохраняются текущий журнал и два предыдущих. Новый лимит применяется к ним сразу.</p>
+<button class="btn" type="submit" disabled>Сохранить лимит журнала</button><p id="logSettingsMessage" role="status" class="csv-note"></p></form></section>
 </div></div></div>
 <div id="csvImportModal" class="modal"><div class="modal-box" style="width:min(760px,96vw)"><div class="modal-title">Умный CSV-фильтр <button class="close-x" title="Закрыть" aria-label="Закрыть" data-close="csvImportModal">×</button></div><div class="modal-body">
 <p id="csvDestination" class="csv-note"></p>
@@ -3804,7 +4213,7 @@ function parseConditionsCsv(input){
   return {conditions,errors,duplicates,total:rows.length-1};
 }
 function showCsvReport(message){$('csvReport').textContent=message}
-let loadSettingsData=null;
+let loadSettingsData=null,historyRefreshTimer=null;
 function applyLoadSettingsView(data){
   loadSettingsData=data;const p=data.profile;
   $('loadProfileName').textContent=p.name+(p.manual_modified?' — изменён вручную':' — значения пресета');
@@ -3814,10 +4223,14 @@ function applyLoadSettingsView(data){
     const input=key==='storage_mode'?`<select class="select" id="${id}" name="${key}">${Object.entries(data.storage_modes).map(([value,title])=>`<option value="${value}" ${p[key]===value?'selected':''}>${esc(title)}</option>`).join('')}</select>`:`<input class="input" id="${id}" name="${key}" type="number" required min="${data.ranges[key][0]}" max="${data.ranges[key][1]}" step="1" value="${p[key]}">`;
     return `<div class="field"><label for="${id}">${esc(label)}</label>${input}</div>`;
   }).join('');
+  $('logLimitMb').innerHTML=data.log_limits_mb.map(value=>`<option value="${value}">${value} МБ</option>`).join('');$('logLimitMb').value=String(data.log_limit_mb);
+  $('loadPresetApply').disabled=false;
+  document.querySelectorAll('#loadSettingsForm button[type="submit"],#logSettingsForm button[type="submit"]').forEach(button=>button.disabled=false);
   pageRowLimit=p.page_rows;configurePageSizeOptions();
 }
 async function openLoadSettings(field='all'){
   $('loadSettingsModal').classList.add('show');$('loadSettingsMessage').textContent='Загрузка…';
+  clearInterval(historyRefreshTimer);refreshHistoryInfo();historyRefreshTimer=setInterval(refreshHistoryInfo,4000);
   try{const response=await fetch('/api/load-settings');if(!response.ok)throw new Error('Не удалось загрузить настройки');applyLoadSettingsView(await response.json());$('loadSettingsMessage').textContent='';if(field!=='all')document.getElementById('load_'+field)?.focus()}catch(e){$('loadSettingsMessage').textContent=e.message}
 }
 async function saveLoadSettings(payload){
@@ -3826,6 +4239,31 @@ async function saveLoadSettings(payload){
 }
 $('loadSettingsForm').onsubmit=e=>{e.preventDefault();const values={};for(const key of Object.keys(loadSettingsData.labels)){const value=$('load_'+key).value;values[key]=key==='storage_mode'?value:Number(value)}saveLoadSettings({values})};
 $('loadPresetApply').onclick=()=>saveLoadSettings({profile:$('loadPreset').value});
+function applyHistoryInfo(data){
+  applyHistoryRevision(data.history_revision);
+  const size=data.used_bytes>0&&data.used_gb<0.001?'<0,001':Number(data.used_gb).toLocaleString('ru-RU',{maximumFractionDigits:3});
+  $('historyStorageInfo').textContent='Сейчас занято: '+size+' ГБ, результатов запросов: '+data.snapshots;
+  historyBusy=!!data.clearing;$('clearHistoryBtn').disabled=historyBusy||historyClearing;
+  if(data.clearing)$('historySettingsMessage').textContent='Удаление всех результатов запросов…';
+  else if(data.busy)$('historySettingsMessage').textContent='При очистке активный запрос будет остановлен, его промежуточные данные будут удалены.';
+  else if(data.pending_deletions)$('historySettingsMessage').textContent='Удаление части файлов отложено. Заверши просмотр или экспорт либо повтори очистку.';
+  else if(!historyClearing)$('historySettingsMessage').textContent='';
+}
+let historyClearing=false,historyBusy=true;
+async function refreshHistoryInfo(){
+  if(!$('loadSettingsModal').classList.contains('show'))return;
+  try{const response=await fetch('/api/history',{cache:'no-store'});const data=await response.json();if(!response.ok)throw new Error(data.detail||'Не удалось прочитать размер истории');applyHistoryInfo(data)}catch(e){$('historySettingsMessage').textContent=e.message;$('clearHistoryBtn').disabled=true}
+}
+$('clearHistoryBtn').onclick=async()=>{
+  if(historyClearing||!confirm('Удалить все результаты запросов?\n\nТекущий результат тоже будет удалён. Активный запрос будет остановлен. Восстановить удалённые результаты нельзя.'))return;
+  historyClearing=true;$('clearHistoryBtn').disabled=true;$('historySettingsMessage').textContent='Удаление истории…';
+  try{const response=await fetch('/api/history/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true})});const data=await response.json();if(!response.ok)throw new Error(data.detail||'Не удалось очистить историю');applyHistoryInfo(data);$('historySettingsMessage').textContent=data.message}catch(e){$('historySettingsMessage').textContent=e.message}finally{historyClearing=false;$('clearHistoryBtn').disabled=historyBusy}
+};
+$('settingsBtn').onclick=()=>openLoadSettings();
+$('logSettingsForm').onsubmit=async e=>{
+  e.preventDefault();$('logSettingsMessage').textContent='Сохранение…';
+  try{const response=await fetch('/api/load-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({log_limit_mb:Number($('logLimitMb').value)})});const data=await response.json();if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'Проверь значение лимита');loadSettingsData.log_limit_mb=data.log_limit_mb;$('logLimitMb').value=String(data.log_limit_mb);$('logSettingsMessage').textContent='Лимит журнала сохранён.'}catch(e){$('logSettingsMessage').textContent=e.message}
+};
 function refreshCsvApply(){$('csvApplyBtn').disabled=!csvPreview?.conditions.length||!csvTargetPanel}
 async function readCsvFile(){
   const generation=++csvReadGeneration,file=$('csvFile').files?.[0];csvPreview=null;refreshCsvApply();
@@ -3924,18 +4362,18 @@ function addToken(kind){
 }
 document.addEventListener('click',e=>{const b=e.target.closest('.token button');if(!b)return;const typed=b.dataset.typed==='yes',arr=b.dataset.kind==='api'?(typed?apiConditions:apiTerms):(typed?resultConditions:resultTerms);arr.splice(Number(b.dataset.index),1);renderTokens(b.dataset.kind);if(b.dataset.kind==='api')updateApiSummary();else applyClientFilters()});
 function bindTokenInput(kind){const input=$(kind==='api'?'apiTokenInput':'resultTokenInput');input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addToken(kind)}});$(kind==='api'?'apiTokenAdd':'resultTokenAdd').onclick=()=>addToken(kind)}
-function updateApiSummary(){const types=selected('.apiDocType'),statuses=selected('.apiStatus');const parts=[];parts.push(types.length===3&&types.every(x=>CORE_TYPES.has(x))?'основные типы':`${types.length} типов ФД`);parts.push(`${$('timeFrom').value||'00:00'}–${$('timeTo').value||'23:59'}`);parts.push(`${$('qConcurrency').value} параллельно`);if(apiTerms.length+apiConditions.length)parts.push(`быстрых условий: ${apiTerms.length+apiConditions.length}`);if($('qRnm').value.trim())parts.push('РНМ');if($('qKkt').value.trim())parts.push('ЗН ККТ');if($('qFn').value.trim())parts.push('ЗН ФН');if($('qInternal').value.trim()||$('qRetail').value.trim()||$('qAddress').value.trim())parts.push('имя / место / адрес');if($('qShift').value.trim())parts.push(`смена ${$('qShift').value.trim()}`);if(statuses.length)parts.push(`статусы ФНС: ${statuses.join(', ')}`);$('apiFilterSummary').textContent=parts.join(' • ')}
-function apiPayload(){return{date_from:$('dateFrom').value,date_to:$('dateTo').value,time_from:$('timeFrom').value||'00:00',time_to:$('timeTo').value||'23:59',refresh_kkt:$('qRefresh').checked,document_types:selected('.apiDocType'),query_terms:[...apiTerms],query_conditions:apiConditions.map(c=>({...c})),rnm:$('qRnm').value.trim(),kkt_factory_number:$('qKkt').value.trim(),fs_number:$('qFn').value.trim(),internal_name:$('qInternal').value.trim(),retail_place:$('qRetail').value.trim(),address:$('qAddress').value.trim(),shift_num:$('qShift').value.trim(),irkkt_statuses:selected('.apiStatus'),concurrency:Number($('qConcurrency').value)}}
+function updateApiSummary(){const types=selected('.apiDocType'),statuses=selected('.apiStatus');const parts=[];parts.push(types.length===3&&types.every(x=>CORE_TYPES.has(x))?'основные типы':`${types.length} типов ФД`);parts.push(`${$('timeFrom').value||'00:00'}–${$('timeTo').value||'23:59'}`);if(apiTerms.length+apiConditions.length)parts.push(`быстрых условий: ${apiTerms.length+apiConditions.length}`);if($('qRnm').value.trim())parts.push('РНМ');if($('qKkt').value.trim())parts.push('ЗН ККТ');if($('qFn').value.trim())parts.push('ЗН ФН');if($('qInternal').value.trim()||$('qRetail').value.trim()||$('qAddress').value.trim())parts.push('имя / место / адрес');if($('qShift').value.trim())parts.push(`смена ${$('qShift').value.trim()}`);if(statuses.length)parts.push(`статусы ФНС: ${statuses.join(', ')}`);$('apiFilterSummary').textContent=parts.join(' • ')}
+function apiPayload(){return{date_from:$('dateFrom').value,date_to:$('dateTo').value,time_from:$('timeFrom').value||'00:00',time_to:$('timeTo').value||'23:59',refresh_kkt:$('qRefresh').checked,document_types:selected('.apiDocType'),query_terms:[...apiTerms],query_conditions:apiConditions.map(c=>({...c})),rnm:$('qRnm').value.trim(),kkt_factory_number:$('qKkt').value.trim(),fs_number:$('qFn').value.trim(),internal_name:$('qInternal').value.trim(),retail_place:$('qRetail').value.trim(),address:$('qAddress').value.trim(),shift_num:$('qShift').value.trim(),irkkt_statuses:selected('.apiStatus')}}
 function apiIsTargeted(p){return p.rnm||p.kkt_factory_number||p.fs_number||p.internal_name||p.retail_place||p.address||(!(p.query_conditions||[]).some(c=>DOCUMENT_QUERY_TYPES.has(c.type))&&(p.query_terms.length||(p.query_conditions||[]).length))}
 function setBusyUi(busy){$('searchBtn').disabled=busy;$('retryBtn').disabled=busy;$('stopSearchBtn').disabled=!busy;if(busy)$('statusbar').classList.add('show')}
 async function fetchSession(){
   const res=await fetch('/api/session',{cache:'no-store'});if(!res.ok)throw new Error('Не удалось получить состояние запроса');
-  const data=await res.json();pageRowLimit=data.load_profile?.page_rows||1000;
+  const data=await res.json();applyHistoryRevision(data.status?.history_revision);pageRowLimit=data.load_profile?.page_rows||1000;
   configurePageSizeOptions();
   return data;
 }
-function applyRequestToUi(p){if(!p)return;if(p.date_from)$('dateFrom').value=p.date_from;if(p.date_to)$('dateTo').value=p.date_to;$('timeFrom').value=p.time_from||'00:00';$('timeTo').value=p.time_to||'23:59';apiTerms=Array.isArray(p.query_terms)?[...p.query_terms]:[];apiConditions=Array.isArray(p.query_conditions)?p.query_conditions.map(c=>({...c})):[];renderTokens('api');$('qRnm').value=p.rnm||'';$('qKkt').value=p.kkt_factory_number||'';$('qFn').value=p.fs_number||'';$('qInternal').value=p.internal_name||'';$('qRetail').value=p.retail_place||'';$('qAddress').value=p.address||'';$('qShift').value=p.shift_num||'';$('qConcurrency').value=String(p.concurrency||120);$('qRefresh').checked=!!p.refresh_kkt;const types=new Set(p.document_types||[]);document.querySelectorAll('.apiDocType').forEach(x=>x.checked=types.has(x.value));const statuses=new Set(p.irkkt_statuses||[]);document.querySelectorAll('.apiStatus').forEach(x=>x.checked=statuses.has(x.value));updateApiSummary()}
-async function pollStatus(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());if(s.running&&s.found>=100000&&!resultHidden)$('memoryWarning').style.display='block';const pct=s.total?Math.min(100,Math.round(s.done/s.total*100)):0;$('progressBar').style.width=pct+'%';$('statusText').textContent=`${s.stage}: ${s.done}/${s.total} • найдено ${s.found} • неудачных ${s.errors}`+(s.message?' • '+s.message:'');return s}catch(e){return null}}
+function applyRequestToUi(p){if(!p)return;if(p.date_from)$('dateFrom').value=p.date_from;if(p.date_to)$('dateTo').value=p.date_to;$('timeFrom').value=p.time_from||'00:00';$('timeTo').value=p.time_to||'23:59';apiTerms=Array.isArray(p.query_terms)?[...p.query_terms]:[];apiConditions=Array.isArray(p.query_conditions)?p.query_conditions.map(c=>({...c})):[];renderTokens('api');$('qRnm').value=p.rnm||'';$('qKkt').value=p.kkt_factory_number||'';$('qFn').value=p.fs_number||'';$('qInternal').value=p.internal_name||'';$('qRetail').value=p.retail_place||'';$('qAddress').value=p.address||'';$('qShift').value=p.shift_num||'';$('qRefresh').checked=!!p.refresh_kkt;const types=new Set(p.document_types||[]);document.querySelectorAll('.apiDocType').forEach(x=>x.checked=types.has(x.value));const statuses=new Set(p.irkkt_statuses||[]);document.querySelectorAll('.apiStatus').forEach(x=>x.checked=statuses.has(x.value));updateApiSummary()}
+async function pollStatus(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());applyHistoryRevision(s.history_revision);if(s.running&&s.found>=100000&&!resultHidden)$('memoryWarning').style.display='block';const pct=s.total?Math.min(100,Math.round(s.done/s.total*100)):0;$('progressBar').style.width=pct+'%';$('statusText').textContent=`${s.stage}: ${s.done}/${s.total} • найдено ${s.found} • неудачных ${s.errors}`+(s.message?' • '+s.message:'');return s}catch(e){return null}}
 async function watchSearch(resetLocalOnFinish=true,{resultEpoch=resultResetEpoch,filtersEpoch=filterResetEpoch,reveal=false}={}){
   if(statusTimer)clearInterval(statusTimer);setBusyUi(true);let finishing=false,polling=false;
   const tick=async()=>{
@@ -4016,12 +4454,12 @@ const RECEIPT_EQUALS_FIELDS=new Set([
   'totalSum','cashSum','cashTotalSum','electronicSum','ecashTotalSum','prepaidSum','creditSum','provisionSum','price','sum','ndsSum',
   'quantity','count','counter','receiptCount','itemsCount','id','retailPlaceId','_retailPlaceId'
 ]);
-function receiptField(label,value,{address=false,total=false,fieldKey=''}={}){
-  if(!hasDetailValue(value))return '';
+function receiptField(label,value,{address=false,total=false,fieldKey='',apiPath=''}={}){
+  if(!hasDetailValue(value)||hideReceiptZero(fieldKey,value))return '';
   const text=displayDetailValue(value),caption=String(label).trim().replace(/:+$/,'')+':';
   const prefix=!address&&RECEIPT_EQUALS_FIELDS.has(fieldKey)?'= ':'';
   // No copy index anywhere on the address row: normal selection and Ctrl+C only.
-  const attrs=address?'':' data-copy-index="'+pushCopyValue(text)+'" tabindex="0" role="button" title="Нажми, чтобы скопировать"';
+  const attrs=address?(apiPath?' title="'+esc('Поле API: '+apiPath)+'"':''):' data-copy-index="'+pushCopyValue(text)+'" tabindex="0" role="button" title="'+esc('Нажми, чтобы скопировать'+(apiPath?' • Поле API: '+apiPath:''))+'"';
   return '<div class="receipt-row '+(address?'receipt-address':'copyable')+(total?' receipt-total':'')+'"'+attrs+'><span class="receipt-label">'+esc(caption)+'</span><span class="receipt-value">'+prefix+esc(text)+'</span></div>';
 }
 function copyableField(label,value,fieldKey=''){return receiptField(label,value,{fieldKey})}
@@ -4035,53 +4473,51 @@ function detailSection(title,items){
   const content=items.filter(Boolean).join('');
   return content?'<section class="receipt-section">'+(title?'<h3 class="receipt-section-title">'+esc(title)+'</h3>':'')+content+'</section>':'';
 }
-const DETAIL_FIELD_LABELS={
-  user:'Пользователь',userName:'Пользователь',userInn:'ИНН пользователя',inn:'ИНН',
-  operator:'Оператор',operatorInn:'ИНН оператора',cashier:'Кассир',cashierInn:'ИНН кассира',
-  taxationType:'Система налогообложения',taxationSystem:'Система налогообложения',
-  operationType:'Признак расчёта',calculationType:'Тип расчёта',paymentType:'Тип оплаты',
-  totalSum:'Итого',cashSum:'Наличными',cashTotalSum:'Наличными',electronicSum:'Безналичными',
-  ecashTotalSum:'Безналичными',prepaidSum:'Предоплата',creditSum:'Кредит',provisionSum:'Встречное предоставление',
-  receiptCode:'Код чека',kktNumber:'Номер ККТ',kktModel:'Модель ККТ',fiscalDriveModel:'Модель ФН',
-  ffdVersion:'Версия ФФД',fiscalFormatVersion:'Версия ФФД',fiscalDocumentVersion:'Версия ФФД',
-  address:'Адрес',paymentAddress:'Адрес расчётов',retailAddress:'Адрес места установки',
-  retailPlace:'Место расчётов',paymentPlace:'Место расчётов',ofdInn:'ИНН ОФД',ofdName:'ОФД',
-  name:'Наименование',quantity:'Количество',price:'Цена',sum:'Сумма',items:'Позиции',
-  taxes:'Налоги',nds:'НДС',ndsType:'Ставка НДС',ndsSum:'Сумма НДС',
-  correctionType:'Тип коррекции',correctionReason:'Основание коррекции',
-  correctionDescription:'Описание коррекции',correctionDate:'Дата основания коррекции',
-  correctionNumber:'Номер основания коррекции',reason:'Основание',date:'Дата',number:'Номер',
-  registrationNumber:'Регистрационный номер',fiscalDriveNumber:'ЗН ФН',fsFactoryNumber:'ЗН ФН',
-  fiscalDocumentNumber:'ФД',fiscalSign:'ФПД',transactionDate:'Дата и время ФД',shiftNum:'Смена',
-  insertedAt:'Поступление в ОФД',fnsFlcStatus:'Статус ФЛК ФНС',fnsStatus:'Код ФНС',
-  fnsDescription:'Описание ФНС',fnsConfirmation:'Подтверждение ФНС',
-  fiscalReport:'Данные регистрации',fiscalReportCorrection:'Данные перерегистрации',
-  closeArchive:'Данные закрытия ФН',ticket:'Данные чека',receiptCorrection:'Данные коррекции',
-  bso:'Данные БСО',bsoCorrection:'Данные коррекции БСО',openShift:'Данные открытия смены',
-  closeShift:'Данные закрытия смены'
-};
+const DETAIL_FIELD_LABELS=__RECEIPT_FIELD_LABELS__;
+const ZERO_HIDDEN_FIELDS=new Set(__ZERO_HIDDEN_FIELDS__);
 const RECEIPT_PAYLOAD_KEYS=new Set(['fiscalReport','fiscalReportCorrection','closeArchive','ticket','receiptCorrection','bso','bsoCorrection','openShift','closeShift']);
 function isAddressKey(key){return /address|адрес/i.test(key)}
 function isTechnicalKey(key){return /^(insertedAt|irkktStatus|transactionType|online)$|^fns|(^id$|Id$|_id$|^internal)/i.test(key)}
+function hideReceiptZero(key,value){
+  if(!ZERO_HIDDEN_FIELDS.has(key)||typeof value==='boolean')return false;
+  if(typeof value==='number')return Number.isFinite(value)&&value===0;
+  return typeof value==='string'&&/^[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:e[+-]?\d+)?$/i.test(value.trim())&&Number(value.trim().replace(',','.'))===0;
+}
+function receiptLabel(path){
+  const key=path[path.length-1],item=path.indexOf('items');
+  if(item>=0&&path.includes('productCodeNew')&&/^\d+$/.test(path[item+1]||'')){
+    const index=path[item+1],mark=path.indexOf('gs1m');
+    if(mark>=0)return 'Код маркировки позиции '+index+(mark<path.length-1?' / '+(DETAIL_FIELD_LABELS[key]||'Дополнительный реквизит'):'');
+    return (DETAIL_FIELD_LABELS[key]||'Дополнительный реквизит')+' позиции '+index;
+  }
+  if(key==='nds0'||key==='ndsNo'||/^nds(?:Calculated)?\d+$/.test(key))return DETAIL_FIELD_LABELS[key]||'Дополнительный налоговый реквизит';
+  const parts=[];
+  for(let i=0;i<path.length;i++){
+    const part=path[i];if(RECEIPT_PAYLOAD_KEYS.has(part))continue;
+    if(part==='items'&&/^\d+$/.test(path[i+1]||'')){parts.push('Позиция '+path[++i]);continue;}
+    parts.push(/^\d+$/.test(part)?part:(DETAIL_FIELD_LABELS[part]||'Дополнительный реквизит'));
+  }
+  return parts.join(' / ');
+}
 function documentReceiptRows(document,usedFields){
   const main=[],extra=[];
-  const walk=(value,label,technical=false,depth=0,fieldKey='')=>{
+  const walk=(value,path,technical=false,depth=0)=>{
     if(!hasDetailValue(value))return;
+    const key=path[path.length-1];
     if(typeof value==='object'&&depth<8){
-      if(Array.isArray(value))value.forEach((v,i)=>walk(v,label+' '+(i+1),technical,depth+1,fieldKey));
-      else for(const [key,v] of Object.entries(value)){
-        if(depth===0&&usedFields.has(key)&&!technical)continue;
-        const fieldLabel=DETAIL_FIELD_LABELS[key]||key;
-        walk(v,label?label+' / '+fieldLabel:fieldLabel,technical||isTechnicalKey(key),depth+1,key);
+      if(Array.isArray(value))value.forEach((v,i)=>walk(v,[...path,String(i+1)],technical,depth+1));
+      else for(const [child,v] of Object.entries(value)){
+        if(depth===0&&usedFields.has(child)&&!technical)continue;
+        walk(v,[...path,child],technical||isTechnicalKey(child)||!Object.prototype.hasOwnProperty.call(DETAIL_FIELD_LABELS,child),depth+1);
       }
       return;
     }
-    (technical?extra:main).push(receiptField(label,value,{address:isAddressKey(label),fieldKey}));
+    const fieldKey=/^\d+$/.test(key)?path[path.length-2]:key;
+    (technical||typeof value==='object'?extra:main).push(receiptField(receiptLabel(path),value,{address:isAddressKey(receiptLabel(path)),fieldKey,apiPath:path.join('.')}));
   };
   for(const [key,value] of Object.entries(document||{})){
     if(usedFields.has(key))continue;
-    const label=RECEIPT_PAYLOAD_KEYS.has(key)?'':(DETAIL_FIELD_LABELS[key]||key);
-    walk(value,label,isTechnicalKey(key),0,key);
+    walk(value,[key],isTechnicalKey(key)||!Object.prototype.hasOwnProperty.call(DETAIL_FIELD_LABELS,key),0);
   }
   return {main,extra};
 }
@@ -4151,7 +4587,7 @@ function renderDetails(r){
   // Internal IDs of catalog/response metadata are technical, never fiscal receipt rows.
   for(const [prefix,obj] of [['ККТ',r.raw?.kkm],['Ответ ОФД',r.raw?.responseMeta]]){
     for(const [key,value] of Object.entries(obj||{})){
-      if(isTechnicalKey(key)&&key!=='_retailPlaceId')extra.push(copyableField(prefix+' / '+key,value,key));
+      if(isTechnicalKey(key)&&key!=='_retailPlaceId')extra.push(receiptField(prefix+' / '+(DETAIL_FIELD_LABELS[key]||'Служебный реквизит'),value,{fieldKey:key,apiPath:prefix+'.'+key}));
     }
   }
   $('extraDetailsGrid').className='receipt-extra';
@@ -4163,6 +4599,7 @@ function renderDetails(r){
 }
 function closeModal(id){
   $(id).classList.remove('show');
+  if(id==='loadSettingsModal'){clearInterval(historyRefreshTimer);historyRefreshTimer=null;}
   if(id==='detailsModal'){detailLoadGeneration++;detailController?.abort();detailController=null;currentDetailStoreId=null;currentRaw=null;currentDetailRow=null;currentDetailValues=[];$('rawJson').textContent='';$('detailsGrid').innerHTML='';$('extraDetailsGrid').innerHTML=''}
   if(id==='csvImportModal'){csvReadGeneration++;csvPreview=null;csvTargetPanel='';$('csvFile').value='';$('csvReport').textContent=''}
   if(id==='keyModal'){revealedKeys={};$('newApiKey').value='';$('newApiKey').type='password';$('toggleApiKey').classList.remove('visible');renderKeys()}
@@ -4188,7 +4625,6 @@ function resetAllFilters(){
   document.querySelectorAll('#apiPanel input,#resultPanel input').forEach(input=>{
     if(input.type==='checkbox')input.checked=input.defaultChecked;else input.value='';
   });
-  $('qConcurrency').value='120';
   closeModal('csvImportModal');refreshCsvApply();
   updateApiSummary();applyClientFilters();
 }
@@ -4201,6 +4637,23 @@ function resetLoadedResult(){
   ['failedDetailsBtn','catalogRetryBtn','retryBtn'].forEach(id=>$(id).style.display='none');
   render();updateStats();updateResultSummary();
 }
+let historyRevision=null,historySyncRunning=false;
+function applyHistoryRevision(revision){
+  if(revision==null)return;
+  if(historyRevision!==null&&revision<=historyRevision)return;
+  if(historyRevision!==null&&revision!==historyRevision){
+    resetLoadedResult();setResultHidden(false);
+    currentRaw=null;currentDetailValues=[];currentDetailRow=null;
+    setBusyUi(false);render();
+  }
+  historyRevision=revision;
+}
+setInterval(async()=>{
+  if(historySyncRunning||statusTimer||!lastResponse||document.hidden)return;
+  historySyncRunning=true;
+  try{const response=await fetch('/api/status',{cache:'no-store'});if(response.ok)applyHistoryRevision((await response.json()).history_revision)}catch(e){console.debug('Синхронизация истории отложена',e)}finally{historySyncRunning=false}
+},2000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&lastResponse)pollStatus()});
 function resetEverything(){if(!confirm('Сбросить фильтры и результат?'))return;resetAllFilters();resetLoadedResult()}
 function openCsvFilter(target){
   if(!['api','result'].includes(target))return;
@@ -4226,13 +4679,14 @@ $('resetAllFiltersBtn').onclick=resetAllFilters;$('resetEverythingBtn').onclick=
 $('csvFile').onchange=readCsvFile;$('csvApplyBtn').onclick=importCsvConditions;
 $('detailsModal').addEventListener('keydown',e=>{const target=e.target.closest('[data-copy-index]');if(target&&(e.key==='Enter'||e.key===' ')){e.preventDefault();target.click()}});
 $('stopSearchBtn').onclick=stopSearch;$('detailsModal').addEventListener('click',async e=>{const target=e.target.closest('[data-copy-index]');if(!target)return;const i=Number(target.dataset.copyIndex),ok=await copyText(currentDetailValues[i]??'');if(ok){target.classList.add('copied');showCopyToast();setTimeout(()=>target.classList.remove('copied'),850)}else{showCopyToast('Не удалось скопировать')}});$('openDetailTab').onclick=openCurrentDetailInNewTab;$('apiAdvancedBtn').onclick=()=>toggleAdvanced('apiAdvanced','apiAdvancedBtn');$('resultAdvancedBtn').onclick=()=>toggleAdvanced('resultAdvanced','resultAdvancedBtn');$('searchBtn').onclick=doSearch;$('applyResultBtn').onclick=applyClientFilters;$('retryBtn').onclick=retryFailed;$('catalogRetryBtn').onclick=()=>{$('qRefresh').checked=true;doSearch()};$('failedDetailsBtn').onclick=showFailures;$('csvBtn').onclick=downloadCSV;$('jsonBtn').onclick=downloadJSON;$('apiCoreTypes').onclick=()=>setChecks('.apiDocType','core');$('apiAllTypes').onclick=()=>setChecks('.apiDocType','all');$('apiNoTypes').onclick=()=>setChecks('.apiDocType','none');$('resultAllTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=true);applyClientFilters()};$('resultNoTypes').onclick=()=>{document.querySelectorAll('.resultDocType').forEach(x=>x.checked=false);applyClientFilters()};$('resetResultFilters').onclick=resetLocal;$('pageSize').onchange=()=>{currentPage=1;loadLocalPage()};$('firstPage').onclick=()=>{currentPage=1;loadLocalPage()};$('prevPage').onclick=()=>{currentPage=Math.max(1,currentPage-1);loadLocalPage()};$('nextPage').onclick=()=>{currentPage++;loadLocalPage()};$('lastPage').onclick=()=>{currentPage=Math.max(1,Math.ceil(filteredCount/effectivePageSize));loadLocalPage()};document.querySelectorAll('[data-close]').forEach(x=>x.onclick=()=>closeModal(x.dataset.close));document.querySelectorAll('.modal').forEach(m=>m.onclick=e=>{if(e.target===m)closeModal(m.id)});$('copyJson').onclick=async()=>{await navigator.clipboard.writeText(JSON.stringify(currentRaw,null,2));$('copyJson').textContent='Скопировано';setTimeout(()=>$('copyJson').textContent='Копировать JSON',900)};document.querySelectorAll('th[data-sort]').forEach(th=>th.onclick=()=>{const key=th.dataset.sort;if(sortState.key===key)sortState.dir=sortState.dir==='asc'?'desc':'asc';else{sortState.key=key;sortState.dir='asc'}applyClientFilters()});
-['timeFrom','timeTo','qRnm','qKkt','qFn','qInternal','qRetail','qAddress','qShift','qConcurrency'].forEach(id=>$(id).addEventListener('input',updateApiSummary));document.querySelectorAll('.apiDocType,.apiStatus').forEach(x=>x.addEventListener('change',updateApiSummary));['rDateFrom','rDateTo','rTimeFrom','rTimeTo'].forEach(id=>$(id).addEventListener('change',applyClientFilters));
+['timeFrom','timeTo','qRnm','qKkt','qFn','qInternal','qRetail','qAddress','qShift'].forEach(id=>$(id).addEventListener('input',updateApiSummary));document.querySelectorAll('.apiDocType,.apiStatus').forEach(x=>x.addEventListener('change',updateApiSummary));['rDateFrom','rDateTo','rTimeFrom','rTimeTo'].forEach(id=>$(id).addEventListener('change',applyClientFilters));
 $('toggleApiKey').onclick=()=>{const input=$('newApiKey'),btn=$('toggleApiKey'),show=input.type==='password';input.type=show?'text':'password';btn.classList.toggle('visible',show);btn.setAttribute('aria-pressed',show?'true':'false')};
 $('apiKeyBtn').onclick=()=>{$('keyModal').classList.add('show');loadKeys(false)};$('addApiKeyBtn').onclick=addApiKey;$('newApiKey').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addApiKey()}});$('keyList').addEventListener('click',e=>{const s=e.target.closest('.key-select'),d=e.target.closest('.key-delete'),r=e.target.closest('.key-reveal');if(s)selectKey(s.dataset.id);if(d)deleteKey(d.dataset.id);if(r)toggleRevealKey(r.dataset.id)});loadKeys(true);
 updateApiSummary();render();updateStats();restoreSession();checkVersion();
-const requestedLoadSettings=new URLSearchParams(location.search).get("load-settings");if(requestedLoadSettings!==null)openLoadSettings(requestedLoadSettings);
+const settingsParams=new URLSearchParams(location.search),requestedLoadSettings=settingsParams.get('load-settings'),requestedSettings=settingsParams.get('settings');
+if(requestedLoadSettings!==null||requestedSettings!==null)openLoadSettings(requestedLoadSettings||'all').then(()=>{if(requestedSettings==='history')$('settingsHistory').scrollIntoView({block:'start'})});
 </script>
 </body>
 </html>
 
-"""
+""".replace("__RECEIPT_FIELD_LABELS__", json.dumps(RECEIPT_FIELD_LABELS, ensure_ascii=False)).replace("__ZERO_HIDDEN_FIELDS__", json.dumps(sorted(ZERO_HIDDEN_RECEIPT_FIELDS)))
