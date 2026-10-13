@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==========================================
-echo  Сборка 1OFD Fiscal Docs v1.7.8
+echo  Сборка 1OFD Fiscal Docs v1.7.8M
  echo ==========================================
 
 if not exist ".venv\Scripts\python.exe" (
@@ -14,6 +14,10 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 call .venv\Scripts\activate.bat
+set "APP_VERSION="
+for /f %%V in ('python -c "from version import VERSION; print(VERSION)"') do set "APP_VERSION=%%V"
+if not defined APP_VERSION goto :error
+set "EXE_BASENAME=1OFD_FiscalDocs_%APP_VERSION%"
 
 echo [2/5] Обновляю pip...
 python -m pip install --upgrade pip
@@ -40,7 +44,7 @@ echo [5/5] Собираю EXE...
 python tools\pack_resources.py
 if errorlevel 1 goto :error
 pyinstaller --noconfirm --clean --onefile --windowed --noupx ^
-  --name "1OFD_FiscalDocs" ^
+  --name "%EXE_BASENAME%" ^
   --icon "assets\app.ico" ^
   --version-file "assets\version_info.txt" ^
   --manifest "assets\app.manifest" ^
@@ -55,11 +59,11 @@ pyinstaller --noconfirm --clean --onefile --windowed --noupx ^
   main.py
 if errorlevel 1 goto :error
 
-for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash 'dist\1OFD_FiscalDocs.exe' -Algorithm SHA256).Hash.ToLower()"') do echo %%H  1OFD_FiscalDocs.exe>"dist\SHA256SUMS.txt"
+for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash 'dist\%EXE_BASENAME%.exe' -Algorithm SHA256).Hash.ToLower()"') do echo %%H  %EXE_BASENAME%.exe>"dist\SHA256SUMS.txt"
 
 echo.
 echo ГОТОВО.
-echo EXE: %CD%\dist\1OFD_FiscalDocs.exe
+echo EXE: %CD%\dist\%EXE_BASENAME%.exe
 echo SHA256: %CD%\dist\SHA256SUMS.txt
 explorer "%CD%\dist"
 pause

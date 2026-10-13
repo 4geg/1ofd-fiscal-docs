@@ -75,15 +75,20 @@ jobs:
       - name: Create SHA256 checksum
         shell: powershell
         run: |
-          $hash = (Get-FileHash "dist/1OFD_FiscalDocs.exe" -Algorithm SHA256).Hash.ToLower()
-          "$hash  1OFD_FiscalDocs.exe" | Set-Content -Encoding ascii "dist/SHA256SUMS.txt"
+          $appVersion = python -c "from version import VERSION; print(VERSION)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exeName = "1OFD_FiscalDocs_$($appVersion.Trim()).exe"
+          Rename-Item -LiteralPath "dist/1OFD_FiscalDocs.exe" -NewName $exeName
+          $hash = (Get-FileHash "dist/$exeName" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $exeName" | Set-Content -Encoding ascii "dist/SHA256SUMS.txt"
+          "APP_VERSION=$($appVersion.Trim())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 1OFD_FiscalDocs-v1.7.5-Windows
+          name: 1OFD_FiscalDocs-v${{ env.APP_VERSION }}-Windows
           path: |
-            dist/1OFD_FiscalDocs.exe
+            dist/1OFD_FiscalDocs_*.exe
             dist/SHA256SUMS.txt
 
       - name: Attach EXE to GitHub Release
@@ -91,6 +96,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/1OFD_FiscalDocs.exe
+            dist/1OFD_FiscalDocs_*.exe
             dist/SHA256SUMS.txt
           generate_release_notes: true

@@ -1,6 +1,13 @@
-# AI GUIDE — 1OFD Fiscal Docs 1.7.8
+# AI GUIDE — 1OFD Fiscal Docs 1.7.8M
 
 Автор: **4geg**. 1.7.6 не выпускалась; итог всех её проходов включён в 1.7.7.
+
+## Изменения 1.7.8M
+
+- `VERSION = "1.7.8M"`, tag `v1.7.8M`, отображаемое и строковое PE-значения совпадают; FixedFileInfo — `(1, 7, 8, 1)`. M — пользовательское обозначение modified, не prerelease. `semantic_version` принимает M, сравнивает базовые числа и затем признак modified, сохраняя правила prerelease. 1.7.8 < 1.7.8M < 1.7.9. Старые выпуски до этой правки M не распознают.
+- Локальная сборка получает VERSION из version.py и формирует `1OFD_FiscalDocs_<VERSION>.exe`. Actions переименовывает файл после PyInstaller, вычисляет SHA-256 для нового имени и прикладывает `dist/1OFD_FiscalDocs_*.exe`; artifact name берёт APP_VERSION. Проверка author/committer, триггеры, permissions и остальные условия workflow сохранены.
+- `lastViewedDocument` — одна строка, ключ `store_id:row_id` с fallback на `detailKey`. Устанавливается только после успешного `showDetails`, после проверки generation/epoch. `render()` добавляет `.last-viewed` только соответствующей строке. Не хранить полный JSON, набор всех просмотренных документов или индекс строки на странице. Фильтры/сортировка/страницы сохраняют отметку; `acceptResponse` нового store и `resetLoadedResult` сбрасывают её. Состояние относится к текущей вкладке, refresh не сохраняет отметку.
+- `resultCoreTypes` использует тот же CORE_TYPES, что apiCoreTypes, и запускает только `applyClientFilters` по локальной БД. Не менять верхние условия и не запускать новый API-поиск. В CORE_TYPES входят registration/reregistration/close.
 
 ## Изменения 1.7.8
 
